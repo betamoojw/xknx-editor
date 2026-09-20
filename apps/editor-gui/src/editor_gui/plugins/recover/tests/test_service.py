@@ -48,6 +48,8 @@ class _FakeProject:
         self.params: list[tuple[str, str]] = []
         self.gas: list[int] = []
         self.addresses: list[tuple[int | None, int | None]] = []
+        self.names: list[str] = []
+        self.descriptions: list[tuple[int, str]] = []
         self.segments_for: list[str] = []
         self.pretend_exists = False
 
@@ -74,6 +76,7 @@ class _FakeProject:
         parameters: list[tuple[str, str]] | None = None,
     ) -> int:
         self.addresses.append((segment_id, address))
+        self.names.append(name)
         self.params.extend(parameters or [])
         return 7
 
@@ -90,6 +93,11 @@ class _FakeProject:
 
     def set_flag(self, device: Any, ref_id: str, flag: str, value: bool) -> None:
         self.flags.append((ref_id, flag, value))
+
+    def set_device_description(
+        self, node_id: int, old_description: str, new_description: str
+    ) -> None:
+        self.descriptions.append((node_id, new_description))
 
     def set_param(self, device: Any, ref_id: str, value: str) -> None:
         self.params.append((ref_id, value))
@@ -146,6 +154,7 @@ def test_apply_to_project_writes_links_flags_and_params(application) -> None:  #
             application=application,
             product_ref_id="P-1",
             hardware2program_ref_id="HP-1",
+            product_name="AKH-0400.03",
             recovered=recovered,
         )
     ]
@@ -156,6 +165,10 @@ def test_apply_to_project_writes_links_flags_and_params(application) -> None:  #
     # Device placed on the segment for its address, with the device octet set.
     assert project.segments_for == ["1.1.5"]
     assert project.addresses == [(1, 5)]
+    # The bus has no clear name, so the device is named after the matched product.
+    assert project.names == ["AKH-0400.03"]
+    # ...and its individual address is recorded as the description.
+    assert project.descriptions == [(7, "1.1.5")]
     # Recovered parameters are passed as overrides at creation.
     assert (ref_id, "1") in project.params
     assert project.gas == [0x0B00]  # created once

@@ -46,3 +46,24 @@ def test_topology_not_stale_after_reading_group_addresses(tmp_path: Path) -> Non
     _ = proj.group_addresses  # poison
 
     assert any(a.area_number == 7 for a in proj.get_areas())
+
+
+def test_create_group_address_value_is_idempotent_and_visible(tmp_path: Path) -> None:
+    """``create_group_address_value`` (the recover apply path) must create the GA and
+    return the same id on a second call for the same raw value.
+
+    Regression: the idempotency read passed an extra installation argument the core
+    ``group_addresses(project_id)`` does not accept, so every call raised ``TypeError``.
+    In recover-apply that exception was swallowed per device, leaving the device added
+    but no group addresses created.
+    """
+    proj = _project(tmp_path)
+    raw = (1 << 11) | (1 << 8) | 5  # 1/1/5 in the three-level style
+
+    ga_id = proj.create_group_address_value(raw, "recovered")
+    assert ga_id is not None
+    assert raw in {g.raw for g in proj.group_addresses}
+
+    # Second call for the same value must not duplicate the row.
+    assert proj.create_group_address_value(raw) == ga_id
+    assert sum(1 for g in proj.group_addresses if g.raw == raw) == 1

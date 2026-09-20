@@ -659,6 +659,21 @@ class MenuStrings:
         return _("Save project as")
 
     @property
+    def OVERWRITE_TITLE(self) -> str:
+        return _("Replace existing file?")
+
+    @property
+    def OVERWRITE_PROMPT(self) -> str:
+        return _(
+            "A file named {name} already exists in:\n{dir}\n\n"
+            "Saving here replaces its current contents. This cannot be undone."
+        )
+
+    @property
+    def BTN_OVERWRITE(self) -> str:
+        return _("Replace")
+
+    @property
     def FILE_DIALOG_PROJECT_FILTER(self) -> str:
         return _("XKNX project (*.xknx)")
 

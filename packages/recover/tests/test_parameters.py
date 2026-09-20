@@ -88,7 +88,21 @@ def test_seeded_ui_yields_com_object_mapping(application) -> None:  # type: igno
     assert all(ref_id.startswith(application.id) for ref_id in mapping.values())
 
 
-def test_com_object_ref_by_number_covers_every_defined_number(application) -> None:  # type: ignore[no-untyped-def]
+def test_segment_sizes_match_encoded_seed_lengths(application) -> None:  # type: ignore[no-untyped-def]
+    # Recover sizes its read-back from ``segment_sizes()`` instead of the encoded seeds, so
+    # that a single default that cannot be encoded (which makes ``encode_to_memory_masked``
+    # raise) no longer blanks out the whole read-only scan. The two must agree on every
+    # segment length for the sizing to stay correct.
+    ui = application.dynamic_ui()
+    assert ui is not None
+    sizes = ui.segment_sizes()
+    encoded = {
+        seg_id: len(data)
+        for seg_id, (data, _mask) in ui.encode_to_memory_masked().items()
+    }
+    assert sizes == encoded
+    assert any(size > 0 for size in sizes.values())
+
     """Every defined com object number resolves to a reference id.
 
     The parameter-driven UI may not expose objects a device can still link (optional

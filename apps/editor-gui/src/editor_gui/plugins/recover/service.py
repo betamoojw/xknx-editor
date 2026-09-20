@@ -584,10 +584,15 @@ class RecoverService:
                 device_octet = int(entry.address.split(".")[-1])
             except ValueError:
                 device_octet = None
+            # The device carries no human-readable name on the bus (only IA, app id and the
+            # configured image), so default to the matched catalog product name; fall back to
+            # the individual address when no product matched. The ETS clear name is project
+            # metadata and stays unrecoverable.
+            device_name = entry.product_name or entry.address
             device_id = project.add_device(
                 entry.product_ref_id,
                 entry.hardware2program_ref_id,
-                entry.address,
+                device_name,
                 application,
                 segment_id=segment_id,
                 address=device_octet,
@@ -598,6 +603,9 @@ class RecoverService:
             )
             if device_id is None:
                 return False
+            # The bus carries no ETS clear name/description, so stamp the individual
+            # address as the description to record where the device came from.
+            project.set_device_description(device_id, "", entry.address)
             device = next((d for d in project.devices if d.node_id == device_id), None)
             if device is None:
                 return False
@@ -606,6 +614,22 @@ class RecoverService:
             number_to_ref = recovered.com_object_refs or com_object_ref_by_number(
                 application
             )
+            if self._log is not None:
+                persisted = [
+                    co
+                    for co in getattr(device, "com_objects", [])
+                    if getattr(co, "db_id", None) is not None
+                ]
+                self._log.debug(
+                    "recover apply device",
+                    address=entry.address,
+                    device_id=device_id,
+                    com_objects=len(getattr(device, "com_objects", [])),
+                    persisted_com_objects=len(persisted),
+                    number_to_ref=len(number_to_ref),
+                    links=len(recovered.links),
+                    group_objects=len(recovered.group_objects),
+                )
             self._apply_flags(device, recovered, number_to_ref)
             self._apply_links(device, recovered, number_to_ref, ga_ids)
         except Exception as exc:  # never crash the render loop / batch on one device
@@ -647,10 +671,24 @@ class RecoverService:
         project = self._api.project
         for link in recovered.links:
             ref_id = number_to_ref.get(link.group_object_number)
-            if ref_id is None:
-                continue
-            com_object = device.find_com_object(ref_id)
-            if com_object is None or com_object.db_id is None:
+            com_object = device.find_com_object(ref_id) if ref_id is not None else None
+            db_id = (
+                getattr(com_object, "db_id", None) if com_object is not None else None
+            )
+            if self._log is not None:
+                # One line per link: which links resolve to a persisted com object (and so
+                # get a group address) vs. which are dropped, and why.
+                self._log.debug(
+                    "recover link",
+                    address=recovered.address,
+                    group_object=link.group_object_number,
+                    group_address=link.group_address,
+                    ref_id=ref_id,
+                    com_object_found=com_object is not None,
+                    db_id=db_id,
+                    sending=link.sending,
+                )
+            if ref_id is None or com_object is None or db_id is None:
                 continue
             ga_id = ga_ids.get(link.group_address)
             if ga_id is None:
@@ -658,9 +696,7 @@ class RecoverService:
                 if ga_id is None:
                     continue
                 ga_ids[link.group_address] = ga_id
-            project.link_com_object_to_ga(
-                com_object.db_id, ga_id, is_sending=link.sending
-            )
+            project.link_com_object_to_ga(db_id, ga_id, is_sending=link.sending)
 
     def reset(self) -> None:
         self.entries = []

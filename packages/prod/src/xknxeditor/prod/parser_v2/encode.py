@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import ipaddress
+import math
 import struct
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -50,6 +54,9 @@ from xknxeditor.namespaces.intermediate.parameter_type_t_type_float_encoding imp
 from xknxeditor.namespaces.intermediate.parameter_type_t_type_ipaddress import (
     ParameterTypeTypeIpaddress,
 )
+from xknxeditor.namespaces.intermediate.parameter_type_t_type_ipaddress_version import (
+    ParameterTypeTypeIpaddressVersion,
+)
 from xknxeditor.namespaces.intermediate.parameter_type_t_type_number import (
     ParameterTypeTypeNumber,
 )
@@ -69,6 +76,7 @@ from xknxeditor.namespaces.intermediate.property_parameter_t import PropertyPara
 from xknxeditor.namespaces.intermediate.property_union_t import PropertyUnion
 from xknxeditor.namespaces.intermediate.union_parameter_t import UnionParameter
 
+from ..errors import EncodingError
 from .application_indexer import ApplicationIndexer
 from .state import GlobalState, ModuleState
 
@@ -114,6 +122,53 @@ def _program_little_endian(app: ApplicationProgram) -> bool:
     return order is not None and order.value == "LittleEndian"
 
 
+# Bit-widths of the value types that have no ``size_in_bit`` field of their own because
+# their encoding fixes the width (see ``type_size_in_bit``).
+_FLOAT_ENCODING_SIZE_IN_BIT = {
+    ParameterTypeTypeFloatEncoding.DPT_9: 16,  # KNX DPT 9: 2 octets
+    ParameterTypeTypeFloatEncoding.IEEE_754_SINGLE: 32,
+    ParameterTypeTypeFloatEncoding.IEEE_754_DOUBLE: 64,
+}
+_DATE_SIZE_IN_BIT = 24  # DPT 11: day/month/year octets (the only Date encoding)
+_IPADDRESS_SIZE_IN_BIT = {
+    ParameterTypeTypeIpaddressVersion.IPV4: 32,
+    ParameterTypeTypeIpaddressVersion.IPV6: 128,
+}
+_COLOR_SIZE_IN_BIT = {
+    ParameterTypeTypeColorSpace.RGB: 24,
+    ParameterTypeTypeColorSpace.RGBW: 24,
+    ParameterTypeTypeColorSpace.HSV: 24,
+}
+
+
+def type_size_in_bit(tc: object, *, for_property: bool = False) -> int | None:
+    """Bit-width of a parameter type's encoded value, or ``None`` for an unknown type.
+
+    Several types carry no ``size_in_bit`` attribute because their encoding fixes the
+    width: Float (from its encoding), Date (DPT 11 is 3 octets), IP address (4 octets
+    for IPv4, 16 for IPv6), Color (3 octets for every colour space) and RawData. RawData
+    in a memory address space reserves 4 extra octets for a length prefix
+    (``MaxSize + 4``); a property value has no prefix (``MaxSize``) - the framing is
+    memory-only, so ``for_property`` selects between the two (see ``_encode_raw_data``).
+    Every other type carries ``size_in_bit`` directly. Without this the memory/property
+    writers gated on a plain ``getattr(tc, "size_in_bit", None)`` and silently skipped all
+    five sizeless types, leaving their cells at the segment seed.
+    """
+    if isinstance(tc, ParameterTypeTypeFloat):
+        return _FLOAT_ENCODING_SIZE_IN_BIT.get(tc.encoding)
+    if isinstance(tc, ParameterTypeTypeDate):
+        return _DATE_SIZE_IN_BIT
+    if isinstance(tc, ParameterTypeTypeIpaddress):
+        return _IPADDRESS_SIZE_IN_BIT.get(tc.version)
+    if isinstance(tc, ParameterTypeTypeColor):
+        return _COLOR_SIZE_IN_BIT.get(tc.space)
+    if isinstance(tc, ParameterTypeTypeRawData):
+        # MaxSize bounds the payload; a memory image reserves 4 extra octets for the
+        # length prefix, a property value carries none.
+        return tc.max_size * 8 if for_property else (tc.max_size + 4) * 8
+    return getattr(tc, "size_in_bit", None)
+
+
 def _write_bits(
     buf: bytearray, offset: int, bit_offset: int, size_in_bit: int, value: int
 ) -> None:
@@ -129,15 +184,23 @@ def _write_bits(
 
 
 def _encode_value(
-    str_value: str, size_in_bit: int, tc: object, *, little_endian: bool = False
+    str_value: str,
+    size_in_bit: int,
+    tc: object,
+    *,
+    little_endian: bool = False,
+    for_property: bool = False,
 ) -> int | None:
     """Encode a parameter value string into the integer that ``_write_bits`` packs.
 
     Values are packed MSB-first. The default byte order is big-endian; when the
     application program selects little-endian (``ParameterByteOrder`` in its static
-    options), the byte order of a multi-octet numeric value is reversed, matching
-    the reference engine (which reverses the octets of integer and float values for
-    a little-endian program). Ports the reference engine's per-type value encoders.
+    options), the byte order of a multi-octet numeric value is reversed, as the
+    KNX standard requires (the octets of integer and float values are reversed for
+    a little-endian program). Implements the standard's per-type value encoders.
+
+    ``for_property`` selects the RawData framing: a memory value carries a 4-octet
+    length prefix, a property value carries none (see ``_encode_raw_data``).
     """
     if isinstance(tc, (ParameterTypeTypeNumber, ParameterTypeTypeTime)):
         # A time value is stored as a plain integer in the type's unit.
@@ -160,13 +223,15 @@ def _encode_value(
         return _encode_date(str_value, tc)
 
     if isinstance(tc, ParameterTypeTypeIpaddress):
-        return _encode_ipaddress(str_value)
+        return _encode_ipaddress(str_value, tc)
 
     if isinstance(tc, ParameterTypeTypeColor):
         return _encode_color(str_value, size_in_bit, tc)
 
     if isinstance(tc, ParameterTypeTypeRawData):
-        return _encode_raw_data(str_value, size_in_bit, little_endian)
+        return _encode_raw_data(
+            str_value, tc.max_size, little_endian, with_prefix=not for_property
+        )
 
     return None
 
@@ -217,6 +282,20 @@ def _encode_number(str_value: str, size_in_bit: int) -> int | None:
     return v & ((1 << size_in_bit) - 1)
 
 
+def _to_single(x: float) -> float:
+    """Round a double to IEEE-754 single precision (a 32-bit ``float``).
+
+    A value beyond binary32's range yields signed infinity, not an error - the KNX
+    standard scales in float32 and lets the DPT 9 exponent loop saturate the result, so
+    returning infinity (rather than letting ``struct.pack`` raise) keeps a finite-but-huge
+    input on the saturation path instead of failing to encode.
+    """
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.inf if x > 0 else -math.inf
+
+
 def _encode_float(
     str_value: str, size_in_bit: int, tc: ParameterTypeTypeFloat
 ) -> int | None:
@@ -224,30 +303,54 @@ def _encode_float(
         f = float(str_value)
     except (ValueError, TypeError):
         return None
-    if tc.encoding == ParameterTypeTypeFloatEncoding.DPT_9:
-        # KNX DPT 9 (2 octet float): value = 0.01 * m * 2^exp, m = 11 bit signed
-        # two's complement, sign in bit 15, exponent in bits 14..11.
-        mantissa = round(f * 100)
-        exp = 0
-        while mantissa < -2048 or mantissa > 2047:
-            mantissa >>= 1
-            exp += 1
-        if exp > 15:
-            return None
-        sign = 1 if mantissa < 0 else 0
-        return (sign << 15) | (exp << 11) | (mantissa & 0x7FF)
-    if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_SINGLE:
-        return struct.unpack(">I", struct.pack(">f", f))[0]
-    if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_DOUBLE:
-        return struct.unpack(">Q", struct.pack(">d", f))[0]
+    # nan/inf survive float() but blow up round() (DPT 9) or are silently accepted by
+    # struct.pack (IEEE) - either way they are not encodable, so reject them up front and
+    # let the write path raise EncodingError rather than programming a bogus image.
+    if not math.isfinite(f):
+        return None
+    try:
+        if tc.encoding == ParameterTypeTypeFloatEncoding.DPT_9:
+            # KNX DPT 9 (2 octet float): value = 0.01 * m * 2^exp, m an 11 bit signed
+            # two's complement (its sign is replicated into bit 15), exponent in bits 14..11.
+            # The KNX standard picks the smallest exponent whose real scaled value fits
+            # the mantissa range, then rounds once on that scaled value (banker's rounding).
+            # The bound is asymmetric - a positive value may reach 2047, a negative one 2048 -
+            # and a mantissa that rounds to zero carries no sign bit. Rounding the *signed*
+            # value and deriving the sign from the result reproduces both: round(-0.1) == 0
+            # -> no sign. The scaling is done in SINGLE precision (a float32 multiply by 100)
+            # and only then widened to double for the exponent search and rounding. Scaling in
+            # float64 instead diverges by an LSB or a whole exponent (0.295 -> 0x1D not 0x1E;
+            # 20.4700001 -> 0x07FF not 0x0C00), so reproduce the single-precision scale before
+            # widening. A finite input whose scaled value overflows binary32 becomes +/-inf
+            # (see _to_single) and falls straight through the loop into the saturation branch.
+            scaled = _to_single(_to_single(f) * 100.0)
+            negative = scaled < 0.0
+            threshold = 2048.0 if negative else 2047.0
+            exp = 0
+            while abs(scaled) / (1 << exp) > threshold:
+                exp += 1
+                if exp > 15:
+                    # The KNX standard saturates rather than failing: the exponent clamps
+                    # to 15 and the magnitude to its range limit, giving 0x7FFF for a positive
+                    # overflow and 0xF800 for a negative one.
+                    return (0x8000 | (15 << 11)) if negative else ((15 << 11) | 0x7FF)
+            mantissa = round(scaled / (1 << exp))
+            sign = 0x8000 if mantissa < 0 else 0
+            return sign | (exp << 11) | (mantissa & 0x7FF)
+        if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_SINGLE:
+            return struct.unpack(">I", struct.pack(">f", f))[0]
+        if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_DOUBLE:
+            return struct.unpack(">Q", struct.pack(">d", f))[0]
+    except (ValueError, OverflowError):
+        return None
     return None
 
 
 def _encode_text(str_value: str, size_in_bit: int) -> int:
     """Code-page (Latin-1) text, truncated and zero-padded to the field width.
 
-    Zero padding also provides the null terminator implicitly (the reference
-    engine relies on the zero-initialised buffer for termination).
+    Zero padding also provides the null terminator implicitly (the KNX standard
+    relies on the zero-initialised buffer for termination).
     """
     encoded = str_value.encode("latin-1", errors="replace")
     n_bytes = size_in_bit // 8
@@ -259,7 +362,7 @@ def _encode_date(str_value: str, tc: ParameterTypeTypeDate) -> int | None:
     """KNX date: 3 octets day, month, year mod 100 (value ``YYYY-MM-DD``).
 
     When the type does not display the year, the year octet stays zero (the
-    reference engine writes only day and month for that formatting).
+    KNX standard writes only day and month for that formatting).
     """
     parts = str_value.split("-")
     if len(parts) != 3:
@@ -272,37 +375,39 @@ def _encode_date(str_value: str, tc: ParameterTypeTypeDate) -> int | None:
     return (day << 16) | (month << 8) | year_octet
 
 
-def _encode_ipaddress(str_value: str) -> int | None:
-    """IPv4 dotted-quad to 4 octets in network (big-endian) order."""
-    parts = str_value.split(".")
-    if len(parts) != 4:
-        return None
+def _encode_ipaddress(str_value: str, tc: ParameterTypeTypeIpaddress) -> int | None:
+    """An IP address to its network-order octets: 4 for IPv4, 16 for IPv6.
+
+    The address family must match the type's declared ``version`` (a v4 literal in a
+    v6 field, or vice versa, does not encode).
+    """
     try:
-        octets = [int(p) for p in parts]
+        addr = ipaddress.ip_address(str_value.strip())
     except ValueError:
         return None
-    if any(o < 0 or o > 255 for o in octets):
+    want = 16 if tc.version == ParameterTypeTypeIpaddressVersion.IPV6 else 4
+    packed = addr.packed
+    if len(packed) != want:
         return None
-    return int.from_bytes(bytes(octets), "big")
+    return int.from_bytes(packed, "big")
 
 
 def _encode_color(
     str_value: str, size_in_bit: int, tc: ParameterTypeTypeColor
 ) -> int | None:
-    """Colour from a ``#RRGGBB``/``#RRGGBBWW`` hex string, per the type's space.
+    """Colour from a ``#RRGGBB`` hex string, per the type's space.
 
-    - RGB: three octets ``[R, G, B]``.
-    - RGBW: four octets ``[R, G, B, W]``.
-    - HSV: three octets ``[H, S, V]`` converted from the RGB value (H scaled to a
-      single octet), matching the reference engine's RGB-to-HSV conversion.
+    Every colour space encodes to three octets per the KNX standard:
+
+    - RGB: ``[R, G, B]``.
+    - RGBW: ``[R, G, B]`` (the white channel is carried out of band, not in this field).
+    - HSV: ``[H, S, V]`` converted from the RGB value (H scaled to a single octet), as
+      the KNX standard's RGB-to-HSV conversion defines.
     """
     try:
         raw = bytes.fromhex(str_value.lstrip("#"))
     except ValueError:
         return None
-    if tc.space == ParameterTypeTypeColorSpace.RGBW:
-        raw = raw[:4].ljust(4, b"\x00")
-        return int.from_bytes(raw, "big")
     if len(raw) < 3:
         return None
     r, g, b = raw[0], raw[1], raw[2]
@@ -332,24 +437,56 @@ def _rgb_to_hsv(r: int, g: int, b: int) -> tuple[int, int, int]:
     return int(255.0 * hue / 360.0), saturation, high
 
 
-def _encode_raw_data(
-    str_value: str, size_in_bit: int, little_endian: bool = False
-) -> int | None:
-    """Raw octets from a hex string, truncated/zero-padded to the field width.
+# Whitespace characters a standard base64 decoder ignores (ASCII space/tab/CR/LF only).
+_BASE64_IGNORED_WHITESPACE = {ord(c): None for c in " \t\r\n"}
 
-    For a little-endian program the octets are preceded by the data length as a
-    four octet little-endian prefix (matching the reference engine), then the whole
-    is padded to the field width.
+
+def _encode_raw_data(
+    str_value: str, max_size: int, little_endian: bool, *, with_prefix: bool
+) -> int | None:
+    """Variable-length data zero-padded to fill the field.
+
+    ``MaxSize`` bounds the *payload* octets directly. A memory image reserves four extra
+    octets for a length prefix (``with_prefix``), so the whole field is ``MaxSize + 4``
+    octets; a property value has no prefix and the field is ``MaxSize`` octets (the ``+4``
+    framing is applied only for memory address spaces, never for properties).
+
+    The value is base64-encoded in the project XML. When present, the length prefix (the
+    payload byte count) follows the program byte order - big-endian for a Motorola/BigEndian
+    program, reversed for a LittleEndian one. The payload octets are opaque and never reversed.
     """
+    # The value is base64-decoded ignoring only the ASCII whitespace characters
+    # space/tab/CR/LF (not other Unicode whitespace), so strip exactly those - a
+    # line-wrapped/pretty-printed value still encodes, an NBSP does not.
     try:
-        data = bytes.fromhex(str_value)
-    except ValueError:
+        data = base64.b64decode(
+            str_value.translate(_BASE64_IGNORED_WHITESPACE), validate=True
+        )
+    except (binascii.Error, ValueError):
         return None
-    if little_endian:
-        data = len(data).to_bytes(4, "little") + data
-    n_bytes = size_in_bit // 8
-    padded = data[:n_bytes].ljust(n_bytes, b"\x00")
-    return int.from_bytes(padded, "big") if padded else 0
+    if len(data) > max_size:  # the payload must fit MaxSize
+        return None
+    padded = data.ljust(max_size, b"\x00")
+    if not with_prefix:
+        return int.from_bytes(padded, "big")
+    length_bytes = len(data).to_bytes(4, "little" if little_endian else "big")
+    return int.from_bytes(length_bytes + padded, "big")
+
+
+def _raw_data_written_octets(str_value: str, max_size: int) -> int | None:
+    """Octets a RawData memory value actually writes: the 4-octet length prefix plus the
+    real payload. The allocated tail (up to ``MaxSize``) is left untouched at the segment
+    seed - the KNX standard writes only the prefix and the actual payload length, not the
+    full reserved field. Returns ``None`` for an unencodable value (the caller raises)."""
+    try:
+        data = base64.b64decode(
+            str_value.translate(_BASE64_IGNORED_WHITESPACE), validate=True
+        )
+    except (binascii.Error, ValueError):
+        return None
+    if len(data) > max_size:
+        return None
+    return 4 + len(data)
 
 
 def resolve_param_values(idx: ApplicationIndexer, state: GlobalState) -> dict[str, str]:
@@ -366,8 +503,8 @@ def resolve_param_values(idx: ApplicationIndexer, state: GlobalState) -> dict[st
     collection path resolves those from its own instance state instead.
     """
     # When several active refs target the same parameter cell (the evaluator can
-    # reach more than one in overlapping conditional branches), the reference
-    # engine keeps the first one in definition order. Iterate parameter_refs in
+    # reach more than one in overlapping conditional branches), the KNX standard
+    # keeps the first one in definition order. Iterate parameter_refs in
     # their (XML/insertion) order and take the first active ref per parameter.
     active = state.active_param_refs()
     overrides: dict[str, str] = {}
@@ -420,7 +557,7 @@ def _union_params_to_write(
 
     Union alternatives can sit at different bit offsets within the shared cell, so
     more than one may be active at once; each active alternative is written (their
-    bits accumulate), matching the reference engine. When nothing is active: in a
+    bits accumulate), as the KNX standard requires. When nothing is active: in a
     resolved UI (gated) the cell keeps its seed; a bare caller falls back to the
     union's default alternative so ``collect_writes`` still yields a value.
     """
@@ -442,11 +579,13 @@ def _collect_param(
     active_ids: set[str] | None = None,
 ) -> None:
     # When an active-ref set is given (resolved UI), encode only active parameters;
-    # inactive cells are left at the segment seed, as the reference engine does.
+    # inactive cells are left at the segment seed, as the KNX standard does.
     if active_ids is not None and item.id not in active_ids:
         return
     choice = item.choice
-    value = overrides.get(item.id) or item.value
+    # An explicit override of "" (empty RawData/Text) is a real value, not "unset", so
+    # membership decides the fallback - not truthiness, which would drop it to the default.
+    value = overrides.get(item.id, item.value)
     # A module parameter's base_value offsets the encoded value by an arg-resolved amount.
     if (
         isinstance(item, ModuleDefStaticParametersParameter)
@@ -651,6 +790,54 @@ def collect_writes(
     return out
 
 
+def _written_width_in_bit(tc: object, value: str) -> int | None:
+    """Bits a memory write actually drives, or ``None`` for an unknown type width.
+
+    Equals the full type width, except RawData narrows to its 4-octet length prefix plus
+    the real payload - the reserved tail up to ``MaxSize`` stays at the segment seed and is
+    never written. Single source of truth shared by the packer and the bit-mask.
+    """
+    size_in_bit = type_size_in_bit(tc)
+    if size_in_bit is None:
+        return None
+    if isinstance(tc, ParameterTypeTypeRawData):
+        written = _raw_data_written_octets(value, tc.max_size)
+        if written is not None and written * 8 < size_in_bit:
+            return written * 8
+    return size_in_bit
+
+
+def _plan_memory_write(
+    tc: object,
+    value: str,
+    param_id: str,
+    parameter_type: str,
+    *,
+    little_endian: bool,
+) -> tuple[int, int] | None:
+    """Plan one memory cell write: return ``(value_to_pack, bits_to_write)`` or ``None``
+    to skip the cell (unknown type width).
+
+    Raises :class:`EncodingError` if the value cannot be encoded against its type. For
+    RawData only the 4-octet length prefix plus the real payload is written; the reserved
+    tail up to ``MaxSize`` stays at the segment seed, so the returned value is narrowed to
+    those leading octets and ``bits_to_write`` shrinks to match.
+    """
+    size_in_bit = type_size_in_bit(tc)
+    if size_in_bit is None:
+        return None
+    encoded = _encode_value(value, size_in_bit, tc, little_endian=little_endian)
+    if encoded is None:
+        raise EncodingError(
+            f"cannot encode parameter {param_id} value {value!r} as {parameter_type}"
+        )
+    write_bits = _written_width_in_bit(tc, value) or size_in_bit
+    if write_bits < size_in_bit:
+        # Keep the leading prefix+payload octets (the padded tail is the low bits).
+        return encoded >> (size_in_bit - write_bits), write_bits
+    return encoded, size_in_bit
+
+
 def encode_to_memory(
     app: ApplicationProgram,
     idx: ApplicationIndexer,
@@ -675,14 +862,17 @@ def encode_to_memory(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        tc = pt.choice
-        size_in_bit = getattr(tc, "size_in_bit", None)
-        if size_in_bit is None:
+        plan = _plan_memory_write(
+            pt.choice,
+            w.value,
+            w.param_id,
+            w.parameter_type,
+            little_endian=little_endian,
+        )
+        if plan is None:
             continue
-        encoded = _encode_value(w.value, size_in_bit, tc, little_endian=little_endian)
-        if encoded is None:
-            continue
-        _write_bits(buf, w.offset, w.bit_offset, size_in_bit, encoded)
+        encoded, write_bits = plan
+        _write_bits(buf, w.offset, w.bit_offset, write_bits, encoded)
     return {seg_id: bytes(buf) for seg_id, buf in bufs.items()}
 
 
@@ -698,7 +888,7 @@ def encode_to_memory_masked(
     byte: ``0xFF`` for bytes an encoded parameter actually wrote, ``0x00`` for
     bytes left at the segment seed. A downloader writes only masked bytes, so it
     never overwrites regions this encoder does not produce (e.g. the com object
-    table or RAM) - mirroring the reference engine, which loads only touched
+    table or RAM) - as the KNX standard does, loading only touched
     bytes on a partial download.
     """
     writes = collect_writes(app, idx, overrides, state)
@@ -717,16 +907,19 @@ def encode_to_memory_masked(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        tc = pt.choice
-        size_in_bit = getattr(tc, "size_in_bit", None)
-        if size_in_bit is None:
+        plan = _plan_memory_write(
+            pt.choice,
+            w.value,
+            w.param_id,
+            w.parameter_type,
+            little_endian=little_endian,
+        )
+        if plan is None:
             continue
-        encoded = _encode_value(w.value, size_in_bit, tc, little_endian=little_endian)
-        if encoded is None:
-            continue
-        _write_bits(buf, w.offset, w.bit_offset, size_in_bit, encoded)
+        encoded, write_bits = plan
+        _write_bits(buf, w.offset, w.bit_offset, write_bits, encoded)
         start_bit = w.offset * 8 + w.bit_offset
-        end_bit = start_bit + size_in_bit - 1
+        end_bit = start_bit + write_bits - 1
         mask = masks[w.seg_id]
         for b in range(start_bit // 8, end_bit // 8 + 1):
             if b < len(mask):
@@ -752,7 +945,7 @@ def build_memory_param_map(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        size = getattr(pt.choice, "size_in_bit", None)
+        size = type_size_in_bit(pt.choice)
         if not size:
             continue
         start_bit = w.offset * 8 + w.bit_offset
@@ -790,7 +983,9 @@ def written_bit_mask(
         if mask is None:
             continue
         pt = idx.parameter_types.get(w.parameter_type)
-        size_in_bit = getattr(getattr(pt, "choice", None), "size_in_bit", None)
+        size_in_bit = (
+            _written_width_in_bit(pt.choice, w.value) if pt is not None else None
+        )
         if not size_in_bit:
             continue
         start_bit = w.offset * 8 + w.bit_offset
@@ -840,14 +1035,24 @@ def _decode_float(raw: int, size_in_bit: int, tc: ParameterTypeTypeFloat) -> str
     if data is None:
         return None
     if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_SINGLE and len(data) == 4:
-        return str(struct.unpack(">f", data)[0])
+        value = struct.unpack(">f", data)[0]
+        # Mirror the encoder's finite check: nan/inf cannot be re-encoded, so a device
+        # holding such bytes has no recoverable value (returning "inf"/"nan" would make
+        # recover record a value that then fails EncodingError on the next image build).
+        return str(value) if math.isfinite(value) else None
     if tc.encoding == ParameterTypeTypeFloatEncoding.IEEE_754_DOUBLE and len(data) == 8:
-        return str(struct.unpack(">d", data)[0])
+        value = struct.unpack(">d", data)[0]
+        return str(value) if math.isfinite(value) else None
     return None
 
 
 def _decode_value(
-    raw: int, size_in_bit: int, tc: object, *, little_endian: bool
+    raw: int,
+    size_in_bit: int,
+    tc: object,
+    *,
+    little_endian: bool,
+    for_property: bool = False,
 ) -> str | None:
     """Best-effort inverse of :func:`_encode_value`; ``None`` when not recoverable.
 
@@ -858,11 +1063,18 @@ def _decode_value(
     not necessarily the exact original text. Non-injective encodings (HSV colour,
     a date whose year the type does not display, sub-octet byte types) return
     ``None`` - the original cannot be reconstructed from the bytes alone.
+
+    ``for_property`` selects the RawData framing (memory has a 4-octet length
+    prefix, a property value has none - see :func:`_encode_raw_data`).
     """
     if isinstance(tc, ParameterTypeTypeRestriction):
         for enumeration in tc.enumeration:
             encoded = _encode_value(
-                str(enumeration.value), size_in_bit, tc, little_endian=little_endian
+                str(enumeration.value),
+                size_in_bit,
+                tc,
+                little_endian=little_endian,
+                for_property=for_property,
             )
             if encoded is not None and encoded == raw:
                 return str(enumeration.value)
@@ -875,28 +1087,32 @@ def _decode_value(
     if isinstance(tc, ParameterTypeTypeTime):
         return str(_apply_byte_order(raw, size_in_bit, little_endian) or 0)
     if isinstance(tc, ParameterTypeTypeFloat):
-        return _decode_float(raw, size_in_bit, tc)
+        # Mirror the encoder: a little-endian program reverses the float octets, so undo
+        # that before interpreting them (Number/Time above do the same).
+        logical = _apply_byte_order(raw, size_in_bit, little_endian)
+        return _decode_float(raw if logical is None else logical, size_in_bit, tc)
     if isinstance(tc, ParameterTypeTypeText):
         data = _field_bytes(raw, size_in_bit)
         return None if data is None else data.rstrip(b"\x00").decode("latin-1")
     if isinstance(tc, ParameterTypeTypeIpaddress):
         data = _field_bytes(raw, size_in_bit)
-        return (
-            None if data is None or len(data) != 4 else ".".join(str(o) for o in data)
-        )
+        if data is None or len(data) not in (4, 16):
+            return None
+        return str(ipaddress.ip_address(data))
     if isinstance(tc, ParameterTypeTypeDate):
         if tc.display_the_year is False:  # year not stored -> not reconstructable
             return None
         day, month, year = (raw >> 16) & 0xFF, (raw >> 8) & 0xFF, raw & 0xFF
         if not (1 <= month <= 12 and 1 <= day <= 31):
             return None
-        return f"{2000 + year:04d}-{month:02d}-{day:02d}"
+        # KNX DPT 11.001 century rule: a stored year of 90..99 maps to 1990..1999,
+        # 0..89 to 2000..2089.
+        century = 1900 if year >= 90 else 2000
+        return f"{century + year:04d}-{month:02d}-{day:02d}"
     if isinstance(tc, ParameterTypeTypeColor):
         data = _field_bytes(raw, size_in_bit)
         if data is None or tc.space == ParameterTypeTypeColorSpace.HSV:
             return None  # HSV<-RGB is lossy; not inverted
-        if tc.space == ParameterTypeTypeColorSpace.RGBW and len(data) >= 4:
-            return "#" + data[:4].hex().upper()
         if len(data) >= 3:
             return "#" + data[:3].hex().upper()
         return None
@@ -904,10 +1120,18 @@ def _decode_value(
         data = _field_bytes(raw, size_in_bit)
         if data is None:
             return None
-        if little_endian and len(data) >= 4:
-            length = int.from_bytes(data[:4], "little")
-            return data[4 : 4 + length].hex().upper()
-        return data.rstrip(b"\x00").hex().upper()
+        if for_property:
+            # A property value has no length prefix; the payload fills the whole field,
+            # zero-padded. Drop the trailing zero padding and re-encode what remains.
+            return base64.b64encode(data.rstrip(b"\x00")).decode("ascii")
+        if len(data) < 4:
+            return None
+        # The length prefix (payload byte count) follows the program byte order; see
+        # _encode_raw_data. The payload octets are opaque and never reversed.
+        length = int.from_bytes(data[:4], "little" if little_endian else "big")
+        if length > len(data) - 4:  # framed length claims more than the field can hold
+            return None
+        return base64.b64encode(data[4 : 4 + length]).decode("ascii")
     return None
 
 
@@ -946,9 +1170,11 @@ def decode_memory_parameters(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        size_in_bit = getattr(pt.choice, "size_in_bit", None)
+        size_in_bit = type_size_in_bit(pt.choice)
         if not size_in_bit:
             continue
+        if w.offset * 8 + w.bit_offset + size_in_bit > len(data) * 8:
+            continue  # field does not fit the bytes we read (do not decode zero-fill)
         raw = _read_bits(data, w.offset, w.bit_offset, size_in_bit)
         result[w.param_id] = _decode_value(
             raw, size_in_bit, pt.choice, little_endian=little_endian
@@ -990,14 +1216,14 @@ def decode_property_parameters(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        size_in_bit = getattr(pt.choice, "size_in_bit", None)
+        size_in_bit = type_size_in_bit(pt.choice, for_property=True)
         if not size_in_bit:
             continue
         if w.offset * 8 + w.bit_offset + size_in_bit > len(data) * 8:
             continue  # field does not fit the bytes we read
         raw = _read_bits(data, w.offset, w.bit_offset, size_in_bit)
         result[w.param_id] = _decode_value(
-            raw, size_in_bit, pt.choice, little_endian=little_endian
+            raw, size_in_bit, pt.choice, little_endian=little_endian, for_property=True
         )
     return result
 
@@ -1008,18 +1234,25 @@ def _decode_field(
     idx: ApplicationIndexer,
     *,
     little_endian: bool,
+    for_property: bool,
 ) -> str | None:
     """Decode one write's field from ``data`` (its segment/property bytes)."""
     pt = idx.parameter_types.get(w.parameter_type)
     if pt is None:
         return None
-    size_in_bit = getattr(pt.choice, "size_in_bit", None)
+    size_in_bit = type_size_in_bit(pt.choice, for_property=for_property)
     if not size_in_bit:
         return None
     if w.offset * 8 + w.bit_offset + size_in_bit > len(data) * 8:
         return None
     raw = _read_bits(data, w.offset, w.bit_offset, size_in_bit)
-    return _decode_value(raw, size_in_bit, pt.choice, little_endian=little_endian)
+    return _decode_value(
+        raw,
+        size_in_bit,
+        pt.choice,
+        little_endian=little_endian,
+        for_property=for_property,
+    )
 
 
 def decode_module_parameters(
@@ -1050,7 +1283,9 @@ def decode_module_parameters(
         for w in writes.mem:
             data = segments.get(w.seg_id)
             if data is not None:
-                value = _decode_field(w, data, idx, little_endian=little_endian)
+                value = _decode_field(
+                    w, data, idx, little_endian=little_endian, for_property=False
+                )
                 for ref_id in param_to_refs.get(w.param_id, []):
                     result[scope.qualify(ref_id)] = value
         for w in writes.prop:
@@ -1065,7 +1300,9 @@ def decode_module_parameters(
                     None,
                 )
             if data is not None:
-                value = _decode_field(w, data, idx, little_endian=little_endian)
+                value = _decode_field(
+                    w, data, idx, little_endian=little_endian, for_property=True
+                )
                 for ref_id in param_to_refs.get(w.param_id, []):
                     result[scope.qualify(ref_id)] = value
         for child in scope.module_children():
@@ -1095,12 +1332,17 @@ def encode_to_properties(
         if pt is None:
             continue
         tc = pt.choice
-        size_in_bit = getattr(tc, "size_in_bit", None)
+        size_in_bit = type_size_in_bit(tc, for_property=True)
         if not size_in_bit:
             continue
-        encoded = _encode_value(w.value, size_in_bit, tc, little_endian=little_endian)
+        encoded = _encode_value(
+            w.value, size_in_bit, tc, little_endian=little_endian, for_property=True
+        )
         if encoded is None:
-            continue
+            raise EncodingError(
+                f"cannot encode parameter {w.param_id} value {w.value!r} "
+                f"as {w.parameter_type}"
+            )
         key: PropertyKey = (w.object_index, w.property_id, w.occurrence)
         needed = w.offset + (w.bit_offset + size_in_bit + 7) // 8
         buf = bufs.get(key)
@@ -1125,7 +1367,7 @@ def build_property_param_map(
         pt = idx.parameter_types.get(w.parameter_type)
         if pt is None:
             continue
-        size = getattr(pt.choice, "size_in_bit", None)
+        size = type_size_in_bit(pt.choice, for_property=True)
         if not size:
             continue
         key: PropertyKey = (w.object_index, w.property_id, w.occurrence)

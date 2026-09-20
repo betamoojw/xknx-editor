@@ -178,6 +178,11 @@ class KnxGuiApp:
         self._import_knxproj_save_dialog: pfd.save_file | None = None
         self._export_knxproj_dialog: pfd.save_file | None = None
         self._last_export_path: str | None = None
+        # Overwrite guard: the portable file dialog does not confirm replacing an existing file on
+        # macOS (it wraps AppleScript's "choose file name"), so we ask here. Requests queue as
+        # (target, action) pairs so a second dialog resolving mid-confirmation cannot drop the first.
+        self._overwrite_queue: list[tuple[str, Callable[[], None]]] = []
+        self._overwrite_popup_open = False
         self._myknx_thread: threading.Thread | None = None
         # MyKnx sign-on-export prompt: after the save dialog, ask whether to also request a
         # project certificate. Credentials are prefilled from the environment for convenience.
@@ -464,6 +469,11 @@ class KnxGuiApp:
             default,
             [S.FILE_DIALOG_KNXPROJ_FILTER, "*.knxproj", S.FILE_DIALOG_ALL_FILES, "*"],
         )
+
+    def _begin_export_sign_prompt(self, dest: str) -> None:
+        """Ask about MyKnx certificate signing before running the export to ``dest``."""
+        self._export_pending_dest = dest
+        self._myknx_prompt_requested = True
 
     def _do_export_knxproj(
         self, dest: str, signer: Callable[[str, bytes, str], bytes | None] | None = None
@@ -994,6 +1004,71 @@ class KnxGuiApp:
         else:
             action()
 
+    def _maybe_overwrite_then(
+        self,
+        path: str,
+        action: Callable[[], None],
+        *,
+        save_in_place_ok: bool = False,
+        default_suffix: str | None = None,
+    ) -> None:
+        """Run ``action`` now, or — if ``path`` already exists — ask for overwrite confirmation
+        first. The portable file dialog does not confirm replacing an existing file on macOS (it
+        wraps AppleScript's "choose file name"), so the guard lives here. ``save_in_place_ok`` skips
+        the prompt when the target is the currently-open project itself (a plain save is no loss);
+        it is NOT set for New/Import/Export, which would replace that file with different content.
+        ``default_suffix`` mirrors the suffix the action appends to a suffixless path (``.xknx`` for
+        New/Save-as/Import): without it the existence check would test the raw, suffixless path and
+        silently overwrite the real target. Requests queue so a second dialog resolving
+        mid-confirmation never drops the first action."""
+        if default_suffix is not None and not Path(path).suffix:
+            path = str(Path(path).with_suffix(default_suffix))
+        target = Path(path)
+        current = self._project_service.path
+        same_as_open = (
+            save_in_place_ok
+            and current is not None
+            and target.resolve() == current.resolve()
+        )
+        if target.exists() and not same_as_open:
+            self._overwrite_queue.append((path, action))
+        else:
+            action()
+
+    def _render_overwrite_modal(self) -> None:
+        if not self._overwrite_queue:
+            return
+        if not self._overwrite_popup_open:
+            # Don't steal the stage from another modal — the action of a prior confirmation may have
+            # opened one (e.g. Export opens the MyKnx sign prompt). Opening our popup at the same
+            # level would dismiss it, and its one-shot request flag is already consumed. Wait until
+            # no popup is open, then raise the prompt for the next queued item.
+            if imgui.is_popup_open("", imgui.PopupFlags_.any_popup):
+                return
+            imgui.open_popup(S.OVERWRITE_TITLE)
+            self._overwrite_popup_open = True
+        imgui.set_next_window_size(imgui.ImVec2(460.0, 0.0), imgui.Cond_.always)
+        if not imgui.begin_popup_modal(S.OVERWRITE_TITLE, None)[0]:
+            return
+        path, action = self._overwrite_queue[0]
+        target = Path(path)
+        imgui.text_wrapped(
+            S.OVERWRITE_PROMPT.format(name=target.name, dir=str(target.parent))
+        )
+        imgui.spacing()
+        replace = imgui.button(S.BTN_OVERWRITE)
+        imgui.same_line()
+        cancel = imgui.button(S.BTN_CANCEL)
+        if replace or cancel:
+            # Pop and close before running the action: the action may open its own modal (e.g. the
+            # export sign prompt), and a queued request re-opens this popup on the next frame.
+            self._overwrite_queue.pop(0)
+            self._overwrite_popup_open = False
+            imgui.close_current_popup()
+            if replace:
+                action()
+        imgui.end_popup()
+
     def _render_network_consent_modal(self) -> None:
         if self._network_consent_requested:
             imgui.open_popup(S.NETWORK_CONSENT_TITLE)
@@ -1190,13 +1265,22 @@ class KnxGuiApp:
             result = self._save_project_dialog.result()
             self._save_project_dialog = None
             if result:
-                self._do_new_project(result)
+                self._maybe_overwrite_then(
+                    result,
+                    lambda r=result: self._do_new_project(r),
+                    default_suffix=".xknx",
+                )
 
         if self._save_as_dialog is not None and self._save_as_dialog.ready():
             result = self._save_as_dialog.result()
             self._save_as_dialog = None
             if result:
-                self._do_save_as(result)
+                self._maybe_overwrite_then(
+                    result,
+                    lambda r=result: self._do_save_as(r),
+                    save_in_place_ok=True,
+                    default_suffix=".xknx",
+                )
 
         if self._open_project_dialog is not None and self._open_project_dialog.ready():
             result = self._open_project_dialog.result()
@@ -1212,8 +1296,9 @@ class KnxGuiApp:
             self._export_knxproj_dialog = None
             if result:
                 # Ask about MyKnx certificate signing before running the export.
-                self._export_pending_dest = result
-                self._myknx_prompt_requested = True
+                self._maybe_overwrite_then(
+                    result, lambda r=result: self._begin_export_sign_prompt(r)
+                )
 
         if (
             self._import_knxproj_save_dialog is not None
@@ -1224,7 +1309,11 @@ class KnxGuiApp:
             source = self._import_knxproj_source
             self._import_knxproj_source = None
             if result and source is not None:
-                self._do_import_knxproj(source, result)
+                self._maybe_overwrite_then(
+                    result,
+                    lambda r=result, s=source: self._do_import_knxproj(s, r),
+                    default_suffix=".xknx",
+                )
 
     def _handle_shortcuts(self) -> None:
         io = imgui.get_io()
@@ -1612,6 +1701,7 @@ class KnxGuiApp:
         self._render_progress_modal()
         self._render_import_password_modal()
         self._render_network_consent_modal()
+        self._render_overwrite_modal()
         self._render_url_prompt_modal()
         self._render_myknx_sign_modal()
         self._render_about_modal()

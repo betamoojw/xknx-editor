@@ -7,7 +7,7 @@ for the memory-mapped model, or through each object's table reference for System
 B - and reads them back. The bytes are then decoded by :mod:`.tables_decode`.
 
 Table lengths are taken from the application (the count octet for the address and
-association tables, the segment seed length for the com object table), so only the
+association tables, the declared segment size for the com object table), so only the
 configured region is read. All reads are read-only.
 """
 
@@ -153,7 +153,7 @@ async def read_parameter_memory(
     skipped. This is the raw material parameter recovery matches against.
     """
     ui = _require_ui(application)
-    seeds = ui.encode_to_memory_masked()
+    sizes = ui.segment_sizes()
     memory_mapped = _is_memory_mapped(application)
     result: dict[str, bytes] = {}
     # A single unreadable segment (a realisation whose memory map we do not fully
@@ -161,17 +161,17 @@ async def read_parameter_memory(
     # recovers the parameters from the segments that could be read.
     if memory_mapped:
         base_addresses = ui.segment_base_addrs()
-        for segment_id, (data, _mask) in seeds.items():
+        for segment_id, size in sizes.items():
             base = base_addresses.get(segment_id)
-            if not data or base is None:
+            if not size or base is None:
                 continue
             try:
-                result[segment_id] = await programmer.read_memory(base, len(data))
+                result[segment_id] = await programmer.read_memory(base, size)
             except (LoadStateError, VerificationError, XKNXException):
                 continue
         return result
-    for segment_id, (data, _mask) in seeds.items():
-        if not data:
+    for segment_id, size in sizes.items():
+        if not size:
             continue
         match = _RELATIVE_SEGMENT.search(segment_id)
         if match is None:
@@ -179,7 +179,7 @@ async def read_parameter_memory(
         object_index = int(match.group(1))
         try:
             base = await programmer.read_table_reference(object_index)
-            result[segment_id] = await programmer.read_memory(base, len(data))
+            result[segment_id] = await programmer.read_memory(base, size)
         except (LoadStateError, VerificationError, XKNXException):
             # Segment not allocated / no table reference / unreadable: skip it.
             continue
@@ -201,7 +201,7 @@ async def _read_memory_mapped(
     static = application.program.static
     ui = _require_ui(application)
     base_addresses = ui.segment_base_addrs()
-    seeds = ui.encode_to_memory_masked()
+    sizes = ui.segment_sizes()
 
     address_table = static.address_table
     assert address_table is not None and address_table.code_segment is not None
@@ -233,8 +233,8 @@ async def _read_memory_mapped(
         and com_object_table.code_segment is not None
         and com_object_table.code_segment in base_addresses
     ):
-        seed = seeds.get(com_object_table.code_segment)
-        if seed is not None and seed[0]:
+        seg_size = sizes.get(com_object_table.code_segment)
+        if seg_size:
             # The writer overlays records at the segment base (offset 0), so read
             # from the base - not base+offset. Read the declared segment length,
             # bounded by the highest defined object number so a realisation whose
@@ -245,7 +245,7 @@ async def _read_memory_mapped(
             co_address = base_addresses[com_object_table.code_segment]
             highest = _highest_com_object_number(application)
             table_length = min(
-                len(seed[0]), _COM_OBJECT_HEADER + (highest + 1) * _COM_OBJECT_RECORD
+                seg_size, _COM_OBJECT_HEADER + (highest + 1) * _COM_OBJECT_RECORD
             )
             try:
                 co_bytes = await programmer.read_memory(co_address, table_length)

@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,10 @@ from editor_gui.concurrency import io_guarded, revision_cached
 from editor_gui.device import Device
 from editor_gui.plugins.project.ui.history import HistoryEntry
 from editor_gui.settings import config_dir
-from xknxeditor.namespaces.intermediate import ComObjectInstanceRef
+from xknxeditor.namespaces.intermediate import (
+    ComObjectInstanceRef,
+    ParameterInstanceRef,
+)
 from xknxeditor.namespaces.intermediate.enable_t import Enable
 from xknxeditor.prod import Application
 from xknxeditor.prod.app_id import parse_app_id
@@ -89,6 +93,21 @@ def _parse_group_address(text: str) -> int | None:
     if len(nums) == 1:
         return nums[0]
     return None
+
+
+def _parameter_instance_refs(
+    parameters: list[tuple[str, str]] | None,
+) -> list[ParameterInstanceRef]:
+    """Wrap ``(ref_id, value)`` overrides as parameter instance refs for a fresh ``Device``.
+
+    A device built with these resolves its dynamic UI against the given values, so the
+    activated (param-driven) com-object set matches the configuration rather than the raw
+    application defaults. Empty when there are no overrides (the default set is kept)."""
+    if not parameters:
+        return []
+    return [
+        ParameterInstanceRef(ref_id=ref_id, value=value) for ref_id, value in parameters
+    ]
 
 
 def _qualified_com_object_ref(co_row: Any, app_program_id: str) -> str:
@@ -638,7 +657,12 @@ class ProjectService:
                     home=str(path),
                     working=str(working),
                 )
-            self._log.info("project opened", path=str(path), devices=len(self.devices))
+            self._log.info(
+                "project opened",
+                path=str(path),
+                devices=len(self.devices),
+                group_range_roots=len(self.get_group_range_tree()),
+            )
 
     def import_knxproj(
         self, source: Path, dest: Path, *, password: str | None = None
@@ -880,10 +904,22 @@ class ProjectService:
                 rows = list(self._svc.devices(self._pid))
                 total = len(rows)
                 report = self.build_progress
+                started = time.monotonic()
+                self._log.debug("building devices", total=total)
                 for i, row in enumerate(rows, start=1):
                     device = self._build_device(row)
                     if device is not None:
                         devices.append(device)
+                        # Verbose per-device trace: the build is otherwise a silent gap
+                        # between "opening project" and "project opened".
+                        self._log.debug(
+                            "built device",
+                            index=i,
+                            total=total,
+                            device_id=row.id,
+                            address=device.individual_address,
+                            name=device.name,
+                        )
                     if report is not None:
                         label = (
                             f"{device.individual_address}  {device.name}".strip()
@@ -891,6 +927,12 @@ class ProjectService:
                             else (row.name or "")
                         )
                         report(i, total, label)
+                self._log.info(
+                    "devices built",
+                    built=len(devices),
+                    skipped=total - len(devices),
+                    seconds=round(time.monotonic() - started, 2),
+                )
             self._devices_cache = devices
             self._devices_cache_version = self._version
         return self._devices_cache
@@ -1527,11 +1569,47 @@ class ProjectService:
                 )
             except ValueError:
                 address = None
-        init_device = Device(node_id=0, name=name, app=app, individual_address="")
+        pirs = _parameter_instance_refs(parameters)
+        # A module-scoped parameter override (…_M-100_MI-1_P-…) only routes into its module scope
+        # once that scope has been materialized — building with parameter_instance_refs alone leaves
+        # module channels on their raw application default, so the override is silently ignored and
+        # the persisted com-object set is stale (its refs no longer exist once the override applies,
+        # so _build_device prunes those channels on reload). Discover the module instances from a
+        # first build, then rebuild with them so overrides take effect and the persisted set is
+        # symmetric with _build_device. Non-module devices see an empty list and skip the second pass.
+        probe = Device(
+            node_id=0,
+            name=name,
+            app=app,
+            individual_address="",
+            parameter_instance_refs=pirs,
+        )
+        module_instances = probe.get_module_instances()
+        if module_instances and parameters:
+            from xknxeditor.namespaces.intermediate.module_instance_t import (
+                ModuleInstance as _MI,
+            )
+
+            # Drop the probe's heavy DynamicUI before building the second one, so peak memory holds
+            # one evaluator, not two.
+            probe.release_dynamic_ui()
+            init_device = Device(
+                node_id=0,
+                name=name,
+                app=app,
+                individual_address="",
+                parameter_instance_refs=pirs,
+                module_instances=[
+                    _MI(id=instance_id, ref_id=ref_id)
+                    for instance_id, ref_id in module_instances
+                ],
+            )
+            module_instances = init_device.get_module_instances()
+        else:
+            init_device = probe
         com_objects: list[tuple[str, str | None]] = [
             (co.id, None) for co in init_device.com_objects
         ]
-        module_instances = init_device.get_module_instances()
         device_id = self._svc.add_device(
             self._pid,
             segment_id,
@@ -1927,7 +2005,7 @@ class ProjectService:
         existing = next(
             (
                 ga.id
-                for ga in self._svc.group_addresses(self._pid, _INSTALLATION)
+                for ga in self._svc.group_addresses(self._pid)
                 if ga.address == value
             ),
             None,
@@ -2175,13 +2253,17 @@ class ProjectService:
         """Signature of the currently-effective (non-reverted) events.
 
         Includes the event type and a repr of its data, not just the id: a store that deletes
-        events on branch (undo + new command) can reuse an id, which an id-only set would miss."""
+        events on branch (undo + new command) can reuse an id, which an id-only set would miss.
+
+        Commissioning bookkeeping (recorded right after a successful program) is excluded: it
+        never affects the generated image, so it must not count as "edited" and lock out the
+        read-only pre-flight self-test on a device that was only re-programmed."""
         if self._pid is None:
             return frozenset()
         return frozenset(
             (entry.id, entry.event_type, repr(entry.data))
             for entry in self._svc.history(self._pid)
-            if not entry.reverted
+            if not entry.reverted and entry.event_type != "SetDeviceCommissioning"
         )
 
     @io_guarded(lambda: False)

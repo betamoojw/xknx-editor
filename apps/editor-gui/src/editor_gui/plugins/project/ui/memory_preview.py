@@ -7,6 +7,7 @@ from imgui_bundle import imgui
 from editor_gui.device import Device
 from editor_gui.plugins.project.strings import S
 from editor_gui.widgets import HexView
+from xknxeditor.prod.errors import EncodingError
 
 
 class MemoryPreviewWindow:
@@ -23,6 +24,7 @@ class MemoryPreviewWindow:
         self._ref_data: dict[str, bytes] = {}
         self._ref_path_buf: str = ""
         self._ref_seg_id: str | None = None
+        self._encode_error: str | None = None
 
     def open(self, device: Device) -> None:
         self._device = device
@@ -38,7 +40,15 @@ class MemoryPreviewWindow:
             self._device = devices[0]
 
         device = self._device
-        self._segments = device.encode_to_memory()
+        # A parameter that cannot be encoded raises rather than emitting a partial image
+        # (see EncodingError). This preview runs every frame, so degrade to an inline
+        # message instead of letting the exception tear down the render loop.
+        try:
+            self._segments = device.encode_to_memory()
+            self._encode_error = None
+        except EncodingError as exc:
+            self._segments = {}
+            self._encode_error = str(exc)
         self._base_addrs = device.get_segment_base_addrs()
         self._param_maps = device.get_memory_param_map()
 
@@ -62,7 +72,9 @@ class MemoryPreviewWindow:
             self._render_save_modal()
             self._render_load_ref_modal()
             segments = list(self._segments.items())
-            if not segments:
+            if self._encode_error is not None:
+                imgui.text_disabled(f"Cannot encode memory image: {self._encode_error}")
+            elif not segments:
                 imgui.text_disabled("No memory segments.")
             elif imgui.begin_tab_bar("##segs"):
                 for i, (seg_id, data) in enumerate(segments):

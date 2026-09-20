@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from xknxeditor.prod import Application
+from xknxeditor.prod.errors import EncodingError
 
 from .errors import ImageError
 from .project_data import (
@@ -204,10 +205,12 @@ class DownloadImage:
         capacity (e.g. 513/511 octets) while the image segment holds only the used
         entries (a handful of octets). Requiring the whole allocation to lie inside
         one segment made ``masked_writes`` return ``None`` for those tables, so the
-        write path (:meth:`_abs_segment`'s ``if runs``) and the preflight silently
+        write path (``_abs_segment``'s ``if runs``) and the preflight silently
         skipped them and the association table (the group-address links) was never
         written. Clipping to the overlap writes exactly the octets the image
-        produced, exactly as a shorter WriteMem/AbsSegment should.
+        produced, exactly as a shorter WriteMem/AbsSegment should. (Callers relying
+        on a single fully-containing segment - e.g. ``_relative_runs`` - are
+        unaffected: a contained range still overlaps exactly that one segment.)
         """
         end = address + size
         out: list[tuple[int, bytes]] = []
@@ -262,7 +265,12 @@ def build_image(
             ui.set_parameter_ref(ref_id, value)
 
     base_addresses = ui.segment_base_addrs()
-    encoded = ui.encode_to_memory_masked()
+    # A value that cannot encode against its type would leave a cell at the segment seed;
+    # refuse to build (and thus flash) a partial image, surfacing it as an ImageError.
+    try:
+        encoded = ui.encode_to_memory_masked()
+    except EncodingError as exc:
+        raise ImageError(f"cannot encode memory image: {exc}") from exc
     # Skip segments the encoder produced with an all-zero mask: they write nothing
     # (e.g. the address/association/com-object table segments, which carry no
     # parameter data - those tables are built from the group communication below).
@@ -299,6 +307,10 @@ def build_image(
         group_communication.filter_table if group_communication is not None else None
     )
 
+    try:
+        encoded_properties = ui.encode_to_properties()
+    except EncodingError as exc:
+        raise ImageError(f"cannot encode property image: {exc}") from exc
     properties = tuple(
         PropertyValue(
             object_index=key[0],
@@ -306,7 +318,7 @@ def build_image(
             occurrence=key[2],
             data=data,
         )
-        for key, data in ui.encode_to_properties().items()
+        for key, data in encoded_properties.items()
         if data
     )
 

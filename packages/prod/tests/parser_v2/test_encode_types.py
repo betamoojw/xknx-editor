@@ -6,6 +6,8 @@ encoder returns is packed big-endian (MSB first) by _write_bits.
 
 from __future__ import annotations
 
+import base64
+
 from xknxeditor.namespaces.intermediate.parameter_type_t_type_color import (
     ParameterTypeTypeColor,
 )
@@ -29,6 +31,9 @@ from xknxeditor.namespaces.intermediate.parameter_type_t_type_ipaddress import (
 )
 from xknxeditor.namespaces.intermediate.parameter_type_t_type_ipaddress_address_type import (
     ParameterTypeTypeIpaddressAddressType,
+)
+from xknxeditor.namespaces.intermediate.parameter_type_t_type_ipaddress_version import (
+    ParameterTypeTypeIpaddressVersion,
 )
 from xknxeditor.namespaces.intermediate.parameter_type_t_type_number import (
     ParameterTypeTypeNumber,
@@ -81,9 +86,12 @@ def _date(display_the_year: bool = True) -> ParameterTypeTypeDate:
     )
 
 
-def _ipaddress() -> ParameterTypeTypeIpaddress:
+def _ipaddress(
+    version: ParameterTypeTypeIpaddressVersion = ParameterTypeTypeIpaddressVersion.IPV4,
+) -> ParameterTypeTypeIpaddress:
     return ParameterTypeTypeIpaddress(
-        address_type=ParameterTypeTypeIpaddressAddressType.HOST_ADDRESS
+        address_type=ParameterTypeTypeIpaddressAddressType.HOST_ADDRESS,
+        version=version,
     )
 
 
@@ -126,6 +134,69 @@ def test_float_ieee_single() -> None:
     assert _encode_value("1.0", 32, tc) == 0x3F800000
 
 
+def test_float_dpt9_rounds_scaled_mantissa() -> None:
+    # The KNX standard selects the exponent on the real scaled magnitude then rounds
+    # once. 21.03 -> scaled 2103 -> /2 = 1051.5 at exp 1 -> round to 1052 (0x0C1C), i.e.
+    # 21.04. Truncating (the old >>) would give 1051 (0x0C1B) / 21.02, which diverges.
+    tc = _float(ParameterTypeTypeFloatEncoding.DPT_9)
+    assert _encode_value("21.03", 16, tc) == 0x0C1C
+
+
+def test_float_dpt9_zero_mantissa_has_no_sign_bit() -> None:
+    # A tiny negative value whose scaled mantissa rounds to 0 must encode as 0x0000, not
+    # 0x8000. The KNX standard special-cases a zero mantissa to the no-sign pack:
+    # -20.48 (= 0.01 * -2048 * 2^0) is the smallest representable value, so -0.001 -> 0.
+    tc = _float(ParameterTypeTypeFloatEncoding.DPT_9)
+    assert _encode_value("-0.001", 16, tc) == 0x0000
+
+
+def test_float_dpt9_negative_reaches_minus_2048() -> None:
+    # The mantissa bound is asymmetric per the KNX standard: a negative value may
+    # reach magnitude 2048, a positive one only 2047. -20.48 stays at exp 0 (m = -2048),
+    # while +20.48 must bump to exp 1 (m = 1024).
+    tc = _float(ParameterTypeTypeFloatEncoding.DPT_9)
+    assert _encode_value("-20.48", 16, tc) == (0x8000 | (-2048 & 0x7FF))  # 0x8000
+    assert _encode_value("20.48", 16, tc) == (1 << 11) | 1024  # 0x0C00
+
+
+def test_float_dpt9_scales_in_single_precision() -> None:
+    # The KNX standard scales in SINGLE precision (round to float32, then multiply by
+    # 100 in float32) before widening to double for the exponent search and rounding.
+    # 0.295 -> single(0.295) = 0.29499998... -> single(* 100) = 29.4999980...
+    # -> round 29 (0x001D). Scaling in float64 gives exactly 29.5 -> banker's round to
+    # 30 (0x001E), which diverges.
+    tc = _float(ParameterTypeTypeFloatEncoding.DPT_9)
+    assert _encode_value("0.295", 16, tc) == 0x001D
+
+
+def test_float_dpt9_overflow_saturates() -> None:
+    # A finite value too large for DPT 9 saturates per the KNX standard: exponent clamped
+    # to 15, magnitude to its limit -> 0x7FFF positive, 0xF800 negative.
+    # (nan/inf still return None via the finite guard - see test_float_nan_and_inf.)
+    tc = _float(ParameterTypeTypeFloatEncoding.DPT_9)
+    assert _encode_value("670761", 16, tc) == 0x7FFF
+    assert _encode_value("-671089", 16, tc) == 0xF800
+    # A finite value so large its scaled form overflows binary32 (the float32 scale
+    # -> +/-inf) must still saturate, not fall out as unencodable: 1e37 is finite.
+    assert _encode_value("1e37", 16, tc) == 0x7FFF
+    assert _encode_value("-1e37", 16, tc) == 0xF800
+
+
+def test_float_nan_and_inf_return_none() -> None:
+    # nan/inf survive float() but blow up round() (DPT 9) or are silently accepted by
+    # struct.pack (IEEE); they must not leak - the writer relies on None to raise
+    # EncodingError instead of programming a bogus image.
+    for encoding in (
+        ParameterTypeTypeFloatEncoding.DPT_9,
+        ParameterTypeTypeFloatEncoding.IEEE_754_SINGLE,
+        ParameterTypeTypeFloatEncoding.IEEE_754_DOUBLE,
+    ):
+        tc = _float(encoding)
+        assert _encode_value("nan", 32, tc) is None
+        assert _encode_value("inf", 32, tc) is None
+        assert _encode_value("-inf", 32, tc) is None
+
+
 def test_text_latin1_padded() -> None:
     assert _encode_value("AB", 24, _text()) == 0x414200
 
@@ -162,23 +233,74 @@ def test_color_hsv() -> None:
 
 
 def test_color_rgbw() -> None:
+    # RGBW encodes to three octets like RGB per the KNX standard; the white channel is
+    # not carried in this field, so a trailing #..WW octet is ignored, not written.
     assert (
-        _encode_value("#FF800040", 32, _color(ParameterTypeTypeColorSpace.RGBW))
-        == 0xFF800040
+        _encode_value("#FF800040", 24, _color(ParameterTypeTypeColorSpace.RGBW))
+        == 0xFF8000
     )
 
 
-def test_raw_data_hex() -> None:
-    assert _encode_value("0a0b", 16, _raw_data()) == 0x0A0B
+# RawData value is base64-encoded in the XML; the memory layout is a four octet length
+# prefix (the payload byte count) followed by the payload, zero-padded to fill the field.
+# Per the KNX standard SizeInBits = 8 * MaxSize and RawData reserves +4 octets, so MaxSize
+# bounds the *payload* and the whole field is MaxSize + 4 octets. With MaxSize 16 the field
+# is 20 octets (160 bit), the payload capacity is 16, and the length prefix follows the
+# program byte order (payload never reversed).
+_RAW_DATA_BITS = (16 + 4) * 8
 
 
-def test_raw_data_padded() -> None:
-    assert _encode_value("0a", 16, _raw_data()) == 0x0A00
+def test_raw_data_base64_big_endian_length_prefix() -> None:
+    # "Cgs=" decodes to b"\x0a\x0b" (2 octets) -> big-endian length prefix 0x00000002
+    encoded = _encode_value("Cgs=", _RAW_DATA_BITS, _raw_data())
+    assert encoded is not None
+    assert encoded.to_bytes(20, "big") == b"\x00\x00\x00\x02\x0a\x0b" + b"\x00" * 14
 
 
-def test_raw_data_little_endian_length_prefix() -> None:
-    # little-endian program: 4 octet little-endian length prefix, then the data
-    assert _encode_value("0a0b", 48, _raw_data(), little_endian=True) == 0x020000000A0B
+def test_raw_data_base64_little_endian_length_prefix() -> None:
+    # only the length prefix follows the program byte order; the payload is never reversed
+    encoded = _encode_value("Cgs=", _RAW_DATA_BITS, _raw_data(), little_endian=True)
+    assert encoded is not None
+    assert encoded.to_bytes(20, "big") == b"\x02\x00\x00\x00\x0a\x0b" + b"\x00" * 14
+
+
+def test_raw_data_payload_over_max_size_returns_none() -> None:
+    # payload capacity is MaxSize = 16; 17 octets no longer fit
+    too_long = base64.b64encode(b"\x00" * 17).decode("ascii")
+    assert _encode_value(too_long, _RAW_DATA_BITS, _raw_data()) is None
+
+
+def test_raw_data_invalid_base64_returns_none() -> None:
+    assert _encode_value("not valid base64 @@@", _RAW_DATA_BITS, _raw_data()) is None
+
+
+def test_raw_data_base64_whitespace_is_ignored() -> None:
+    # Standard base64 decoding ignores only ASCII space/tab/CR/LF; a line-wrapped value
+    # must encode identically to its compact form, but other Unicode whitespace (e.g.
+    # NBSP) is rejected.
+    compact = _encode_value("Cgs=", _RAW_DATA_BITS, _raw_data())
+    wrapped = _encode_value("Cg\n s=\t", _RAW_DATA_BITS, _raw_data())
+    assert wrapped is not None
+    assert wrapped == compact
+    assert _encode_value("Cg\u00a0s=", _RAW_DATA_BITS, _raw_data()) is None
+
+
+def test_raw_data_property_has_no_length_prefix() -> None:
+    # A property value carries no length prefix (the +4 framing is memory-only per the
+    # KNX standard). The field is MaxSize octets: the payload zero-padded, no prefix.
+    encoded = _encode_value("Cgs=", 16 * 8, _raw_data(), for_property=True)
+    assert encoded is not None
+    assert encoded.to_bytes(16, "big") == b"\x0a\x0b" + b"\x00" * 14
+
+
+def test_decode_raw_data_property_round_trip() -> None:
+    # Without a prefix the decoder strips the trailing zero padding and re-encodes the rest.
+    tc = _raw_data()
+    raw = _encode_value("Cgs=", 16 * 8, tc, for_property=True)
+    assert raw is not None
+    assert (
+        _decode_value(raw, 16 * 8, tc, little_endian=False, for_property=True) == "Cgs="
+    )
 
 
 def test_number_little_endian_byte_swap() -> None:
@@ -292,6 +414,15 @@ def test_decode_date_without_year_is_unknown() -> None:
     assert _decode_value(raw, 24, tc, little_endian=False) is None
 
 
+def test_decode_date_1990s_century() -> None:
+    # KNX DPT 11.001: a stored two-digit year of 90..99 is the 1990s, not the 2090s.
+    # The KNX standard reconstructs the same way (year >= 90 -> 1900 + year).
+    tc = _date(display_the_year=True)
+    raw = _encode_value("1995-06-20", 24, tc)
+    assert raw is not None
+    assert _decode_value(raw, 24, tc, little_endian=False) == "1995-06-20"
+
+
 def test_decode_color_rgb() -> None:
     tc = _color(ParameterTypeTypeColorSpace.RGB)
     raw = _encode_value("#0A0B0C", 24, tc)
@@ -306,8 +437,37 @@ def test_decode_color_hsv_is_unknown() -> None:
     assert _decode_value(raw, 24, tc, little_endian=False) is None
 
 
-def test_decode_raw_data_big_endian() -> None:
+def test_decode_raw_data_round_trip_big_endian() -> None:
     tc = _raw_data()
-    raw = _encode_value("aabb", 32, tc)
+    raw = _encode_value("Cgs=", _RAW_DATA_BITS, tc)
     assert raw is not None
-    assert _decode_value(raw, 32, tc, little_endian=False) == "AABB"
+    # decode recovers the base64 payload (using the length prefix, dropping the padding)
+    assert _decode_value(raw, _RAW_DATA_BITS, tc, little_endian=False) == "Cgs="
+
+
+def test_decode_raw_data_round_trip_little_endian() -> None:
+    tc = _raw_data()
+    raw = _encode_value("Cgs=", _RAW_DATA_BITS, tc, little_endian=True)
+    assert raw is not None
+    assert _decode_value(raw, _RAW_DATA_BITS, tc, little_endian=True) == "Cgs="
+
+
+def test_decode_raw_data_length_over_capacity_returns_none() -> None:
+    # A framed length that claims more octets than the field can hold is corrupt: the
+    # decoder must reject it rather than return a truncated (plausible) base64 payload.
+    tc = _raw_data()  # MaxSize 16 -> 20 octet field, payload capacity 16
+    field = (100).to_bytes(4, "big") + b"\x0a\x0b" + b"\x00" * 14
+    raw = int.from_bytes(field, "big")
+    assert _decode_value(raw, _RAW_DATA_BITS, tc, little_endian=False) is None
+
+
+def test_ipaddress_v6_round_trip() -> None:
+    tc = _ipaddress(ParameterTypeTypeIpaddressVersion.IPV6)
+    raw = _encode_value("2001:db8::1", 128, tc)
+    assert raw is not None
+    assert _decode_value(raw, 128, tc, little_endian=False) == "2001:db8::1"
+
+
+def test_ipaddress_v6_literal_in_v4_field_returns_none() -> None:
+    tc = _ipaddress(ParameterTypeTypeIpaddressVersion.IPV4)
+    assert _encode_value("2001:db8::1", 32, tc) is None

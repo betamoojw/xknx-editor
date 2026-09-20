@@ -27,6 +27,10 @@ from xknxeditor.namespaces.intermediate import (
     Rename,
     Repeat,
 )
+from xknxeditor.namespaces.intermediate.module_def_static_t_parameters_union_property import (
+    ModuleDefStaticParametersUnionProperty,
+)
+from xknxeditor.namespaces.intermediate.property_union_t import PropertyUnion
 
 from .application_indexer import ApplicationIndexer
 from .calculation import evaluate_lr, evaluate_rl
@@ -46,6 +50,7 @@ from .encode import (
     encode_to_memory_masked,
     encode_to_properties,
     resolve_param_values,
+    type_size_in_bit,
     written_bit_mask,
 )
 from .nodes import (
@@ -160,6 +165,14 @@ class DynamicTreeBuilder:
         members: dict[str, tuple[int, int, int | None]] = {}
 
         def _add_union(union: object, key: int) -> None:
+            # RawData reserves a 4-octet length prefix only in a memory address space, not in
+            # a property (see type_size_in_bit); use the union's storage kind so a property
+            # RawData member is not treated as 4 octets wider than it is (which would let it
+            # falsely overlap - and so suppress - an independent neighbouring member).
+            for_property = isinstance(
+                getattr(union, "choice", None),
+                (PropertyUnion, ModuleDefStaticParametersUnionProperty),
+            )
             for up in getattr(union, "parameter", []):
                 start = (getattr(up, "offset", 0) or 0) * 8 + (
                     getattr(up, "bit_offset", 0) or 0
@@ -169,7 +182,10 @@ class DynamicTreeBuilder:
                 pt = self.idx.parameter_types.get(pt_id) if pt_id else None
                 choice = getattr(pt, "choice", None) if pt is not None else None
                 if choice is not None:
-                    size = getattr(choice, "size_in_bit", None)
+                    # Sizeless types (Float/Date/IPAddress/Color/RawData) carry no
+                    # size_in_bit attribute; derive their width the same way the writer
+                    # does so union overlap detection sees the real octet span.
+                    size = type_size_in_bit(choice, for_property=for_property)
                 members[up.id] = (key, start, size)
 
         params = app.static.parameters
@@ -591,6 +607,19 @@ class DynamicUI:
     def segment_base_addrs(self) -> dict[str, int]:
         return {
             sid: self._idx.segment_base_addr(sid) for sid in self._idx.code_segments
+        }
+
+    def segment_sizes(self) -> dict[str, int]:
+        """Byte length of each code segment, independent of parameter encoding.
+
+        Recover sizes its read-back from these (how many bytes to read at each segment
+        base, and the com object table extent). Unlike :meth:`encode_to_memory_masked`
+        this runs no value encoding, so a default that cannot be encoded never blanks out
+        the whole read.
+        """
+        return {
+            sid: len(seg.data) if seg.data else seg.size
+            for sid, seg in self._idx.code_segments.items()
         }
 
     def encode_to_memory(self) -> dict[str, bytes]:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import logging
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Protocol
@@ -77,6 +78,26 @@ from xknxeditor.proj.models import (
 logger = logging.getLogger(__name__)
 
 _INSTALLATION_INDEX = 0
+
+
+def _best_effort[T](label: str, fn: Callable[[], T], default: T) -> T:
+    """Run an optional raw-XML reader, degrading to ``default`` (with a visible warning) on any
+    failure instead of aborting the whole import.
+
+    The raw-XML readers only *enrich* the import (binary data, module args, comments, coupler
+    routing, project metadata, loss detection). The topology, group addresses and devices are built
+    independently of them, so a single malformed element must never take the whole import down and
+    leave the user with an empty project (see issue #17)."""
+    try:
+        return fn()
+    except Exception as e:
+        logger.warning(
+            "could not read '%s' from the raw project XML; import continues without it: %s: %s",
+            label,
+            type(e).__name__,
+            e,
+        )
+        return default
 
 
 def import_knxproj(
@@ -296,8 +317,10 @@ def _parse(
         # re-emit module-based devices on export, so read both from the raw installation XML while the
         # archive is still open.
         extras = _read_device_extras(contents)
-        extras.project_comment, extras.traces = _read_project_meta(contents)
-    logger.debug(
+        extras.project_comment, extras.traces = _best_effort(
+            "project metadata", lambda: _read_project_meta(contents), ("", [])
+        )
+    logger.info(
         "parsed knxproj '%s': %d devices, %d group addresses, %d w/ binary data, %d w/ modules, %d traces",
         parser.project_info.name,
         len(parser.devices),
@@ -326,38 +349,67 @@ def _read_device_extras(contents: _ProjectContents) -> _RawExtras:
         logger.debug("could not read raw 0.xml for device extras: %s", e)
         return extras
     # Namespace-agnostic: match on the local tag name so we don't depend on the schema version.
+    device_count = 0
     for device in root.iter():
         if _localname(device.tag) != "DeviceInstance":
             continue
         device_id = device.get("Id")
         if not device_id:
             continue
-        binary = _read_binary_data(device, device_id, contents)
-        if binary:
-            extras.binary_data[device_id] = binary
-        modules = _read_module_args(device)
-        if modules:
-            extras.module_args[device_id] = modules
-        tree = _read_group_object_tree(device)
-        if tree:
-            extras.group_object_trees[device_id] = tree
-        ip_config = _read_ip_config(device)
-        if ip_config is not None:
-            extras.ip_config[device_id] = ip_config
-        additional = _read_additional_addresses(device)
-        if additional:
-            extras.additional_addresses[device_id] = additional
-        comment = device.get("Comment")
-        if comment:
-            extras.device_comment[device_id] = comment
-        for cid, override in _read_com_object_text_overrides(device):
-            extras.com_object_text_overrides[cid] = override
-    extras.unassigned_devices = _read_unassigned_devices(root)
-    _read_coupler_extras(root, extras)
-    _read_locations_extras(root, extras)
-    extras.trades = _read_trades(root)
-    extras.losses = _detect_import_losses(root, extras)
+        device_count += 1
+        # Best-effort per device: a single malformed device's optional extras must not abort the
+        # whole import (which would leave an empty project); the device itself is still built from
+        # the parser's data.
+        try:
+            _read_one_device_extras(device, device_id, contents, extras)
+        except Exception as e:
+            logger.warning(
+                "could not read raw extras for device %s; import continues without them: %s: %s",
+                device_id,
+                type(e).__name__,
+                e,
+            )
+    extras.unassigned_devices = _best_effort(
+        "unassigned devices", lambda: _read_unassigned_devices(root), []
+    )
+    _best_effort("coupler extras", lambda: _read_coupler_extras(root, extras), None)
+    _best_effort("locations extras", lambda: _read_locations_extras(root, extras), None)
+    extras.trades = _best_effort("trades", lambda: _read_trades(root), [])
+    extras.losses = _best_effort(
+        "import losses", lambda: _detect_import_losses(root, extras), []
+    )
+    logger.debug("read raw device extras for %d device instances", device_count)
     return extras
+
+
+def _read_one_device_extras(
+    device: ET.Element, device_id: str, contents: _ProjectContents, extras: _RawExtras
+) -> None:
+    """Collect one ``<DeviceInstance>``'s optional raw-XML extras into ``extras`` (keyed by id).
+
+    Every field here is enrichment xknxproject drops; wrapped per device by the caller so one bad
+    device never aborts the import.
+    """
+    binary = _read_binary_data(device, device_id, contents)
+    if binary:
+        extras.binary_data[device_id] = binary
+    modules = _read_module_args(device)
+    if modules:
+        extras.module_args[device_id] = modules
+    tree = _read_group_object_tree(device)
+    if tree:
+        extras.group_object_trees[device_id] = tree
+    ip_config = _read_ip_config(device)
+    if ip_config is not None:
+        extras.ip_config[device_id] = ip_config
+    additional = _read_additional_addresses(device)
+    if additional:
+        extras.additional_addresses[device_id] = additional
+    comment = device.get("Comment")
+    if comment:
+        extras.device_comment[device_id] = comment
+    for cid, override in _read_com_object_text_overrides(device):
+        extras.com_object_text_overrides[cid] = override
 
 
 def _int_attr(elem: ET.Element, name: str) -> int | None:
@@ -799,20 +851,64 @@ def _build(session: Session, parser: XMLParser, pid: str, extras: _RawExtras) ->
         ],
     )
     session.add(project)
+    logger.debug(
+        "build: project row added (name=%r style=%s schema=%s traces=%d comment=%s)",
+        info.name,
+        project.group_address_style,
+        info.schema_version,
+        len(extras.traces),
+        bool(extras.project_comment),
+    )
 
     installation = Installation(index=_INSTALLATION_INDEX, name="")
     session.add(installation)
 
     state = _ImportState(extras)
+    logger.debug("build: topology (%d areas)", len(parser.areas))
     _build_topology(installation, parser, state)
     # <UnassignedDevices> devices (not placed on any line): kept verbatim as opaque provenance.
     installation.unassigned_devices_xml = extras.unassigned_devices or None
+    areas = len(installation.areas)
+    lines = sum(len(a.lines) for a in installation.areas)
+    segments = sum(len(line.segments) for a in installation.areas for line in a.lines)
+    devices = sum(
+        len(s.devices)
+        for a in installation.areas
+        for line in a.lines
+        for s in line.segments
+    )
+    logger.debug(
+        "build: topology done (%d areas, %d lines, %d segments, %d devices, %d unassigned)",
+        areas,
+        lines,
+        segments,
+        devices,
+        len(extras.unassigned_devices),
+    )
+    logger.debug("build: group addresses (%d)", len(parser.group_addresses))
     _build_group_addresses(installation, parser, state)
+    logger.debug(
+        "build: group addresses done (%d ranges, %d addresses)",
+        len(installation.group_ranges),
+        len(state.group_addresses),
+    )
     _build_links(state)
+    logger.debug("build: links done")
     _build_spaces(installation, parser, state)
+    logger.debug("build: spaces done (%d spaces)", len(installation.spaces))
     _build_trades(installation, state)
+    logger.debug("build: trades done (%d)", len(extras.trades))
     # Import-loss notes (raw-XML detection + any build-time dropped lines), echoed at export.
     project.import_notes = dumps(state.extras.losses)
+    logger.info(
+        "built project %s: %d areas, %d lines, %d devices, %d group addresses, %d losses",
+        pid,
+        areas,
+        lines,
+        devices,
+        len(state.group_addresses),
+        len(state.extras.losses),
+    )
 
 
 def _style(value: str) -> GroupAddressStyle:
@@ -927,6 +1023,12 @@ def _append_device(
 ) -> None:
     try:
         segment.devices.append(_build_device(xdevice, state))
+        # Verbose per-device trace so the import is not a silent gap.
+        logger.debug(
+            "imported device %s (id=%s)",
+            getattr(xdevice, "individual_address", "?"),
+            xdevice.identifier,
+        )
     except Exception as e:
         # Partial load: a single malformed device must not abort the whole import.
         logger.warning(

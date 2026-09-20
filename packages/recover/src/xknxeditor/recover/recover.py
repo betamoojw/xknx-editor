@@ -72,9 +72,16 @@ def seed_dynamic_ui(
     application defaults) makes the UI materialise the same module instances - and
     therefore the same runtime com object numbers - as the device. Seeding goes
     through the state constructor, not ``set_parameter_ref``, so inactive/conditional
-    references are stored without the active-only check that would raise. Returns
+    references are stored without the active-only check that would raise.
+
+    A module-scoped override (``…_M-100_MI-1_P-…``) only routes into its module scope
+    once that scope is materialised, so a first build discovers the module instances
+    and a second build is seeded with them; without this the override is ignored and
+    the map emits the default ref, which no longer matches the object the project
+    persists once the override applies (links then resolve to nothing). Returns
     ``None`` when the application has no dynamic section.
     """
+    from xknxeditor.namespaces.intermediate.module_instance_t import ModuleInstance
     from xknxeditor.namespaces.intermediate.parameter_instance_ref_t import (
         ParameterInstanceRef,
     )
@@ -82,11 +89,20 @@ def seed_dynamic_ui(
 
     if application.dynamic_ui() is None:
         return None
+    pirs = [
+        ParameterInstanceRef(ref_id=ref_id, value=value)
+        for ref_id, value in parameter_values.items()
+    ]
+    probe = DynamicUI(application.program, parameter_instance_refs=pirs)
+    module_instances = probe.get_module_instances()
+    if not (module_instances and pirs):
+        return probe
     return DynamicUI(
         application.program,
-        parameter_instance_refs=[
-            ParameterInstanceRef(ref_id=ref_id, value=value)
-            for ref_id, value in parameter_values.items()
+        parameter_instance_refs=pirs,
+        module_instances=[
+            ModuleInstance(id=instance_id, ref_id=ref_id)
+            for instance_id, ref_id in module_instances
         ],
     )
 

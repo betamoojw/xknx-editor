@@ -395,6 +395,38 @@ def test_import_real_file(tmp_path: Path) -> None:
     assert svc.group_addresses(pid)
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "_read_one_device_extras",
+        "_read_unassigned_devices",
+        "_read_coupler_extras",
+        "_read_locations_extras",
+        "_read_trades",
+        "_detect_import_losses",
+        "_read_project_meta",
+    ],
+)
+def test_import_survives_optional_reader_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """A raw-XML enrichment reader that raises must degrade gracefully (regression guard for issue
+    #17): topology, group addresses and devices are built from the parser independently of these
+    optional extras, so a single reader failure must still yield a non-empty project rather than an
+    empty devices/group-address view."""
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("simulated malformed element")
+
+    monkeypatch.setattr(knxproj_import, target, _boom)
+    dest = tmp_path / "resilient.xknx"
+    pid = import_knxproj(_REAL, dest)
+    svc = ProjectService()
+    svc.open(dest)
+    assert svc.devices(pid)
+    assert svc.group_addresses(pid)
+
+
 def test_read_com_object_text_overrides() -> None:
     from xml.etree import ElementTree as ET
 
