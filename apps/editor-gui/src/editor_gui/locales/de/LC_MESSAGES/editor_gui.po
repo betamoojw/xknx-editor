@@ -80,8 +80,8 @@ msgstr "Datei"
 msgid "New Project"
 msgstr "Neues Projekt"
 
-msgid "Open Project"
-msgstr "Projekt öffnen"
+msgid "Open Project (.knxproj/.xknx)"
+msgstr "Projekt öffnen (.knxproj/.xknx)"
 
 msgid "Open Recent"
 msgstr "Zuletzt geöffnet"
@@ -479,3 +479,12 @@ msgstr "{count} Linie(n) hatten in verschiedenen Anlagen dieselbe Adresse. Beim 
 
 msgid "For example: {examples}"
 msgstr "Zum Beispiel: {examples}"
+
+msgid "Product catalog imported: {count} new products from {name}"
+msgstr "Produktkatalog importiert: {count} neue Produkte aus {name}"
+
+msgid "{name} was already in the catalog, nothing new imported"
+msgstr "{name} war bereits im Katalog, nichts Neues importiert"
+
+msgid "Product catalog import"
+msgstr "Produktkatalog-Import"

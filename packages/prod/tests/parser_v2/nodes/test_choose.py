@@ -50,8 +50,29 @@ class TestTokenMatches:
         assert _token_matches("4", "<=4") is True
         assert _token_matches("5", "<=4") is False
 
+    def test_equal_operator(self):
+        # "=N" is a numeric equality, so it accepts numerically equal but differently spelled
+        # operands (e.g. leading zeros) that a plain literal would miss.
+        assert _token_matches("4", "=4") is True
+        assert _token_matches("5", "=4") is False
+        assert _token_matches("04", "=4") is True
+
+    def test_not_equal_operator(self):
+        assert _token_matches("5", "!=4") is True
+        assert _token_matches("4", "!=4") is False
+
+    def test_negative_operand(self):
+        assert _token_matches("-1", ">=-2") is True
+        assert _token_matches("-1", "=-1") is True
+
+    def test_operator_with_non_integer_operand_returns_false(self):
+        assert _token_matches("1", "=x") is False
+        assert _token_matches("1", "!=") is False
+
     def test_non_integer_value_with_operator_returns_false(self):
         assert _token_matches("x", ">1") is False
+        assert _token_matches("x", "!=1") is False
+        assert _token_matches("x", "=1") is False
 
 
 class TestValueMatches:

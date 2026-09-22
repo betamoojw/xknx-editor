@@ -64,3 +64,15 @@ msgstr "Opgeslagen als {name}"
 
 msgid "Save project as"
 msgstr "Project opslaan als"
+
+msgid "Product catalog imported: {count} new products from {name}"
+msgstr "Productcatalogus geïmporteerd: {count} nieuwe producten uit {name}"
+
+msgid "{name} was already in the catalog, nothing new imported"
+msgstr "{name} stond al in de catalogus, niets nieuws geïmporteerd"
+
+msgid "Product catalog import"
+msgstr "Productcatalogus importeren"
+
+msgid "Open Project (.knxproj/.xknx)"
+msgstr "Project openen (.knxproj/.xknx)"

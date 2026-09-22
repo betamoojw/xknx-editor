@@ -4,11 +4,15 @@ from ..context import EvalContext
 from ..ui import UiNode
 from .base import DynamicNode
 
-_OPERATORS = (">=", "<=", ">", "<")
+_OPERATORS = ("!=", ">=", "<=", ">", "<", "=")
 
 
 def _token_matches(value: str, token: str) -> bool:
-    """Match one Test token: literal equality or a comparison (``>0``, ``<=5``)."""
+    """Match one Test token: a comparison (``>0``, ``<=5``, ``!=2``, ``=3``) or a bare literal.
+
+    Operator operands are compared as integers, so ``=`` / ``!=`` are numeric equality. A token with
+    no operator prefix is matched as a plain literal.
+    """
     for op in _OPERATORS:
         if token.startswith(op):
             try:
@@ -21,7 +25,11 @@ def _token_matches(value: str, token: str) -> bool:
                 return left <= right
             if op == ">":
                 return left > right
-            return left < right
+            if op == "<":
+                return left < right
+            if op == "!=":
+                return left != right
+            return left == right
     return value == token
 
 

@@ -151,6 +151,8 @@ def _minimal_parser(areas: list[Any]) -> SimpleNamespace:
         group_addresses=[],
         spaces=[],
         functions=[],
+        # Flat list of every parsed device, as the real XMLParser exposes it (import inventory log).
+        devices=[dev for area in areas for line in area.lines for dev in line.devices],
     )
 
 

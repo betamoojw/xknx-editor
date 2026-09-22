@@ -829,6 +829,21 @@ def _localname(tag: str) -> str:
 
 
 def _build(session: Session, parser: XMLParser, pid: str, extras: _RawExtras) -> None:
+    # Raw parser inventory at INFO (not DEBUG) so a default remote log shows what xknxproject
+    # handed us. parser.devices is the flat concatenation of every line's devices across all areas
+    # (topology-derived: it excludes <UnassignedDevices> and any device xknxproject itself dropped,
+    # e.g. one without an individual address). Comparing it to the built device count below isolates
+    # losses our importer adds (duplicate-line drops, per-device build failures) from what xknxproject
+    # delivered. A 0 here means xknxproject placed no device on any line, which can be an empty
+    # topology, an all-unassigned project, or an upstream parse issue, not necessarily an empty file.
+    logger.info(
+        "import parsed archive: %d devices, %d areas, %d group addresses, %d spaces, %d functions",
+        len(parser.devices),
+        len(parser.areas),
+        len(parser.group_addresses),
+        len(parser.spaces),
+        len(parser.functions),
+    )
     info = parser.project_info
     project = Project(
         id=pid,
@@ -901,12 +916,16 @@ def _build(session: Session, parser: XMLParser, pid: str, extras: _RawExtras) ->
     # Import-loss notes (raw-XML detection + any build-time dropped lines), echoed at export.
     project.import_notes = dumps(state.extras.losses)
     logger.info(
-        "built project %s: %d areas, %d lines, %d devices, %d group addresses, %d losses",
+        "built project %s: %d/%d devices placed (%d skipped), %d areas, %d lines, "
+        "%d group addresses, %d unassigned, %d losses",
         pid,
+        devices,
+        len(parser.devices),
+        state.skipped_devices,
         areas,
         lines,
-        devices,
         len(state.group_addresses),
+        len(extras.unassigned_devices),
         len(state.extras.losses),
     )
 
@@ -1031,11 +1050,15 @@ def _append_device(
         )
     except Exception as e:
         # Partial load: a single malformed device must not abort the whole import.
+        state.skipped_devices += 1
         logger.warning(
-            "skipping malformed device on import",
-            extra={"address": getattr(xdevice, "individual_address", "?")},
+            "skipping malformed device on import (address=%s id=%s): %s: %s",
+            getattr(xdevice, "individual_address", "?"),
+            xdevice.identifier,
+            type(e).__name__,
+            e,
         )
-        logger.debug("device import error: %s: %s", type(e).__name__, e)
+        logger.debug("device import error detail", exc_info=e)
 
 
 def _build_device(xdevice: DeviceInstance, state: _ImportState) -> Device:
@@ -1347,6 +1370,9 @@ class _ImportState:
         self.device_by_identifier: dict[str, Device] = {}
         # Per-device BinaryData / module Arguments captured from the raw project XML.
         self.extras: _RawExtras = extras or _RawExtras()
+        # Devices xknxproject parsed but that failed to build (see _append_device); surfaced in the
+        # import summary so a remote log shows whether devices were dropped rather than never parsed.
+        self.skipped_devices: int = 0
 
     def register_com_object(self, coir: ComObjectInstanceRef, row: ComObject) -> None:
         self.com_objects.append((coir, row))

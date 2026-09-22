@@ -143,6 +143,9 @@ def _fake_parser() -> SimpleNamespace:
         group_addresses=gas,
         spaces=[building],
         functions=[function],
+        # Flat list of every parsed device, as the real XMLParser populates it (used for the
+        # import inventory log that distinguishes "nothing parsed" from "parsed but dropped").
+        devices=[device],
     )
 
 

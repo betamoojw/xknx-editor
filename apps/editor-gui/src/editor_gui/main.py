@@ -237,6 +237,11 @@ class KnxGuiApp:
         self._toast_seen_ts = time.time()
         # Set by the export worker on success; the toast renderer turns it into a green toast.
         self._export_success_msg: str | None = None
+        # Set by the .knxprod load worker; the render loop opens a modal message box with it so a
+        # catalog import gives explicit, click-to-dismiss feedback (not just a log line). _msg holds
+        # the text while the modal is open (worker->render handoff via _result, latched into _msg).
+        self._knxprod_result: str | None = None
+        self._knxprod_msg: str | None = None
         # Lossy-import notes to show in a readable modal (set after a lossy import or before an
         # export that echoes them); rendered by _render_import_notes_modal.
         self._import_notes: list[ImportLoss] = []
@@ -1340,21 +1345,37 @@ class KnxGuiApp:
             self._export_knxproj()
 
     def _load_knxprod(self, path: str) -> None:
+        # A .knxproj is a full project archive, not a product catalog. The file filter is only
+        # advisory on macOS, so a .knxproj can be picked in the "Load .knxprod" dialog; route it
+        # to the project importer (as "Open Project" already does) so its devices get built.
+        # Importing it as a catalog would only extract the embedded product XMLs and then show an
+        # empty device tree, which looks like the project loaded but has "no devices".
+        if path.lower().endswith(".knxproj"):
+            self._prompt_import_dest(path)
+            return
+
         def worker() -> None:
             # Hold the catalog lock so per-frame catalog reads bail while it writes (see io_guarded).
             with self._catalog_service.io_lock:
                 self._log.info("loading knxprod", path=path)
                 try:
                     added = self._catalog_service.import_knxprod(Path(path))
+                    name = Path(path).name
                     if added:
                         self._log.info(
                             "added applications to catalog", count=len(added)
                         )
+                        self._knxprod_result = S.KNXPROD_IMPORT_DONE.format(
+                            count=len(added), name=name
+                        )
                     else:
-                        # Re-import of an already-known product: surface it (toast) instead of
-                        # silently doing nothing, so a double-load is visible to the user.
-                        self._log.warning(
+                        # Re-import of an already-known product: the message box below makes the
+                        # no-op visible, so this stays an info log.
+                        self._log.info(
                             "knxprod already imported — no new products", path=path
+                        )
+                        self._knxprod_result = S.KNXPROD_IMPORT_NOTHING_NEW.format(
+                            name=name
                         )
                 except ArchiveError as e:
                     self._log.error("archive error", path=path, error=str(e))
@@ -1572,6 +1593,33 @@ class KnxGuiApp:
         except Exception as e:
             self._log.error("could not open folder", path=str(path), error=str(e))
 
+    def _render_knxprod_result_modal(self) -> None:
+        # A finished .knxprod catalog import shows a modal message box (success or "nothing new") so
+        # the outcome is explicit and click-to-dismiss. The worker hands the text over via
+        # _knxprod_result; latch it into _knxprod_msg, which stays set until the user clicks OK.
+        if self._knxprod_result is not None:
+            self._knxprod_msg = self._knxprod_result
+            self._knxprod_result = None
+        if self._knxprod_msg is None:
+            return
+        if not imgui.is_popup_open(S.KNXPROD_IMPORT_TITLE):
+            # Don't steal the stage from another modal (e.g. an auto-update prompt at the same popup
+            # depth) — opening ours there would dismiss it. Wait until no popup is open, then raise
+            # ours. If ours was itself displaced, this re-opens it once the other closes, so the
+            # result is never silently lost.
+            if imgui.is_popup_open("", imgui.PopupFlags_.any_popup):
+                return
+            imgui.open_popup(S.KNXPROD_IMPORT_TITLE)
+        imgui.set_next_window_size(imgui.ImVec2(420.0, 0.0), imgui.Cond_.always)
+        if not imgui.begin_popup_modal(S.KNXPROD_IMPORT_TITLE, None)[0]:
+            return
+        imgui.text_wrapped(self._knxprod_msg)
+        imgui.spacing()
+        if imgui.button(S.BTN_OK, imgui.ImVec2(120, 0)):
+            self._knxprod_msg = None
+            imgui.close_current_popup()
+        imgui.end_popup()
+
     def _render_about_modal(self) -> None:
         if self._about_requested:
             imgui.open_popup(S.ABOUT_TITLE)
@@ -1707,6 +1755,7 @@ class KnxGuiApp:
         self._render_about_modal()
         self._render_update_modal()
         self._render_import_notes_modal()
+        self._render_knxprod_result_modal()
         self._keyring_plugin.render_window()
         self._signing_plugin.render_window()
         self._render_welcome()

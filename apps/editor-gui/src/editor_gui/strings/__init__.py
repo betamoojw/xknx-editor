@@ -186,7 +186,7 @@ class MenuStrings:
 
     @property
     def MENU_OPEN_PROJECT(self) -> str:
-        return _("Open Project")
+        return _("Open Project (.knxproj/.xknx)")
 
     @property
     def MENU_SAVE_AS(self) -> str:
@@ -696,6 +696,18 @@ class MenuStrings:
     @property
     def PROGRESS_LOAD_KNXPROD(self) -> str:
         return _("Loading product catalog…")
+
+    @property
+    def KNXPROD_IMPORT_DONE(self) -> str:
+        return _("Product catalog imported: {count} new products from {name}")
+
+    @property
+    def KNXPROD_IMPORT_NOTHING_NEW(self) -> str:
+        return _("{name} was already in the catalog, nothing new imported")
+
+    @property
+    def KNXPROD_IMPORT_TITLE(self) -> str:
+        return _("Product catalog import")
 
     @property
     def PROGRESS_OPEN_PROJECT(self) -> str:

@@ -1,0 +1,68 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: xknx-editor signing 1.0\n"
+"Language: nl\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Signing"
+msgstr "Ondertekenen"
+
+msgid "Signing key…"
+msgstr "Ondertekeningssleutel…"
+
+msgid "Signing key"
+msgstr "Ondertekeningssleutel"
+
+msgid "A signing key is set (exports are signed)."
+msgstr "Er is een ondertekeningssleutel ingesteld (exports worden ondertekend)."
+
+msgid "Placeholder key in use — signatures are not ETS-valid."
+msgstr "Plaatshoudersleutel in gebruik, handtekeningen zijn niet ETS-geldig."
+
+msgid "Modulus (hex)"
+msgstr "Modulus (hex)"
+
+msgid "Private exponent (hex)"
+msgstr "Privé-exponent (hex)"
+
+msgid "Public exponent (hex)"
+msgstr "Openbare exponent (hex)"
+
+msgid "Extract from Knx.Ets.XmlSigning.dll…"
+msgstr "Uit Knx.Ets.XmlSigning.dll halen…"
+
+msgid "Save"
+msgstr "Opslaan"
+
+msgid "Reset to placeholder"
+msgstr "Terugzetten naar plaatshouder"
+
+msgid "All DLLs"
+msgstr "Alle DLL's"
+
+msgid "All files"
+msgstr "Alle bestanden"
+
+msgid "Select \"Knx.Ets.XmlSigning.dll\" from your ETS installation (e.g. C:\\Program Files (x86)\\ETS6)."
+msgstr "Selecteer \"Knx.Ets.XmlSigning.dll\" uit uw ETS-installatie (bijv. C:\\Program Files (x86)\\ETS6)."
+
+msgid "Extracting key from the assembly…"
+msgstr "Sleutel wordt uit de assembly gehaald…"
+
+msgid "Signing key saved."
+msgstr "Ondertekeningssleutel opgeslagen."
+
+msgid "Reverted to the placeholder key."
+msgstr "Teruggezet naar de plaatshoudersleutel."
+
+msgid "No .NET runtime found. Install the .NET SDK (macOS: `brew install dotnet-sdk`) to extract the key, or paste it manually below."
+msgstr "Geen .NET-runtime gevonden. Installeer de .NET SDK (macOS: `brew install dotnet-sdk`) om de sleutel te extraheren, of plak hem hieronder handmatig."
+
+msgid "The key is read from your own licensed ETS assembly and stored per-user, never in the project."
+msgstr "De sleutel wordt gelezen uit uw eigen gelicentieerde ETS-assembly en per gebruiker opgeslagen, nooit in het project."
+
+msgid "Based on OpenKNXproducer (github.com/OpenKNX/OpenKNXproducer)."
+msgstr "Gebaseerd op OpenKNXproducer (github.com/OpenKNX/OpenKNXproducer)."
