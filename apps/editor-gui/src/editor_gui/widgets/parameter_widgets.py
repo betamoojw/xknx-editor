@@ -449,7 +449,9 @@ def _render_block(
     popup_request: EnumPopupRequest | None = None
     if needle:  # while filtering, expand matching blocks so hits are visible
         imgui.set_next_item_open(True, imgui.Cond_.always)
-    is_open = imgui.tree_node(f"{label}##{block_prefix}")
+    # "###" keeps the node's identity keyed on its unique path (block_prefix), so a parameter edit
+    # that changes the block's label does not collapse the tree. block_prefix is already unique.
+    is_open = imgui.tree_node(f"{label}###{block_prefix}")
     imgui.same_line()
     imgui.text_disabled(f"({param_count})")
     if is_open:

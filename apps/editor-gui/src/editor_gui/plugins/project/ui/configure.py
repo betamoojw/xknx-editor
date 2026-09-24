@@ -296,9 +296,12 @@ class ConfigurePanel:
         if imgui.begin_tab_bar("##editor_tabs"):
             ui_nodes = device.get_ui()
             param_count = count_parameters(ui_nodes)
-            if imgui.begin_tab_item(S.EDITOR_TAB_PARAMETERS.format(count=param_count))[
-                0
-            ]:
+            # Stable "###" ids keep the selected tab (and each panel's expansion state) put when a
+            # parameter edit changes a tab's count-bearing label; a bare label folds the count into
+            # the ImGui id, so the tab would lose identity and the bar would jump on every change.
+            if imgui.begin_tab_item(
+                f"{S.EDITOR_TAB_PARAMETERS.format(count=param_count)}###editor_tab_params"
+            )[0]:
                 if ui_nodes:
                     self._param_filter = filter_box(
                         "##param_filter",
@@ -333,7 +336,7 @@ class ConfigurePanel:
 
             visible_cos = device.get_visible_com_objects()
             if imgui.begin_tab_item(
-                S.EDITOR_TAB_GROUP_OBJECTS.format(count=len(visible_cos))
+                f"{S.EDITOR_TAB_GROUP_OBJECTS.format(count=len(visible_cos))}###editor_tab_gos"
             )[0]:
                 self._group_objects_table.render(
                     device, visible_cos, self._get_links, self._get_all_gas
@@ -345,7 +348,9 @@ class ConfigurePanel:
             module_tables = build_module_tables(ui_nodes)
             if module_tables:
                 total = sum(len(t.rows) for t in module_tables)
-                if imgui.begin_tab_item(S.EDITOR_TAB_MODULES.format(count=total))[0]:
+                if imgui.begin_tab_item(
+                    f"{S.EDITOR_TAB_MODULES.format(count=total)}###editor_tab_modules"
+                )[0]:
                     self._module_filter = filter_box(
                         "##module_filter",
                         S.CONFIGURE_PARAM_FILTER_HINT,
@@ -365,7 +370,7 @@ class ConfigurePanel:
                 self._render_dali is not None
                 and device.app is not None
                 and is_mdt_dali_app(device.app.id)
-                and imgui.begin_tab_item(S.EDITOR_TAB_DALI)[0]
+                and imgui.begin_tab_item(f"{S.EDITOR_TAB_DALI}###editor_tab_dali")[0]
             ):
                 self._render_dali(device)
                 imgui.end_tab_item()
@@ -802,6 +807,7 @@ class ConfigurePanel:
             DownloadScope.GROUP_COMMUNICATION,
             DownloadScope.APPLICATION,
             DownloadScope.UNLOAD,
+            DownloadScope.UNLOAD_ALL,
         ]
         labels = [
             S.SCOPE_FULL,
@@ -809,6 +815,7 @@ class ConfigurePanel:
             S.SCOPE_GROUP_COMMUNICATION,
             S.SCOPE_APPLICATION,
             S.SCOPE_UNLOAD,
+            S.SCOPE_UNLOAD_ALL,
         ]
         current = order.index(self._download_scope)
         imgui.align_text_to_frame_padding()

@@ -923,6 +923,26 @@ async def test_expected_descriptor_match_proceeds() -> None:
     assert manager.device.load_states[1] == LoadState.LOADING
 
 
+async def test_authorize_runs_when_levels_positive() -> None:
+    runner, manager = _managed_runner(
+        LdCtrlLoad(obj_type=_ADDRESS_TABLE_TYPE, occurrence=0),
+        authorize_levels=4,
+    )
+    await runner.run()
+    # A device with access protection is authorized once on connect, with the
+    # free access key.
+    assert manager.device.authorize_keys == [0xFFFFFFFF]
+
+
+async def test_authorize_skipped_when_levels_zero() -> None:
+    runner, manager = _managed_runner(
+        LdCtrlLoad(obj_type=_ADDRESS_TABLE_TYPE, occurrence=0),
+        authorize_levels=0,
+    )
+    await runner.run()
+    assert manager.device.authorize_keys == []
+
+
 async def test_negotiate_apdu_uses_device_maximum() -> None:
     runner, manager = _managed_runner(
         LdCtrlLoad(obj_type=_ADDRESS_TABLE_TYPE, occurrence=0),

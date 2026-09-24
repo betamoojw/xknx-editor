@@ -128,6 +128,9 @@ msgstr "Applikationsprogramm"
 msgid "Unload"
 msgstr "Entladen"
 
+msgid "Unload application and address"
+msgstr "Applikation und Adresse entladen"
+
 msgid "Partial: Parameters"
 msgstr "Partiell: Parameter"
 

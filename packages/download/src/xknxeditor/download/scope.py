@@ -56,7 +56,13 @@ class DownloadScope(Enum):
     ``UNLOAD`` is not a partial load: it selects the Unload procedure instead of
     the Load procedure (it removes the application program / resets the Load
     State Machines to Unloaded). The download entry point routes it to the
-    ``Unload`` procedure and runs all of its controls.
+    ``Unload`` procedure and runs all of its controls; the individual address is
+    left untouched.
+
+    ``UNLOAD_ALL`` runs the same Unload procedure and then additionally resets
+    the individual address to the default, returning the device to the
+    unprogrammed state. It requires exactly one device in programming mode for
+    the address reset.
     """
 
     FULL = "full"
@@ -64,6 +70,7 @@ class DownloadScope(Enum):
     GROUP_COMMUNICATION = "grp"
     APPLICATION = "ap1"
     UNLOAD = "unload"
+    UNLOAD_ALL = "unload_all"
 
 
 def control_in_scope(control: object, scope: DownloadScope) -> bool:
@@ -83,9 +90,13 @@ def control_in_scope(control: object, scope: DownloadScope) -> bool:
       not the address/association tables (the group address links). It is the
       "application program" (``ap1``) download.
     """
-    if scope is DownloadScope.FULL or scope is DownloadScope.UNLOAD:
-        # UNLOAD runs the Unload procedure's controls in full (they are resolved
-        # separately by the download entry point, not filtered by object).
+    if scope is DownloadScope.FULL or scope in (
+        DownloadScope.UNLOAD,
+        DownloadScope.UNLOAD_ALL,
+    ):
+        # UNLOAD / UNLOAD_ALL run the Unload procedure's controls in full (they
+        # are resolved separately by the download entry point, not filtered by
+        # object). UNLOAD_ALL additionally resets the individual address there.
         return True
     target = _target_object(control)
     if target is None or target == _DEVICE_OBJECT:

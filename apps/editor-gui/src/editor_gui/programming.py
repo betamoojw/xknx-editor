@@ -159,6 +159,50 @@ async def read_device_overview(xknx: XKNX, address: str) -> DeviceOverview:
     )
 
 
+@dataclass
+class ScannedDevice:
+    """One device found in programming mode: its individual address plus the dossier read off the
+    bus (``overview``), or ``error`` when that read failed (the device answered the broadcast but a
+    point-to-point read did not complete)."""
+
+    address: str
+    overview: DeviceOverview | None = None
+    error: str | None = None
+
+
+# Default individual address of a factory-fresh / unprogrammed device.
+DEFAULT_INDIVIDUAL_ADDRESS = "15.15.255"
+
+
+async def scan_programming_mode_devices(
+    xknx: XKNX, timeout: float = 3.0
+) -> list[ScannedDevice]:
+    """Find every device currently in programming mode and read its dossier.
+
+    Broadcasts an individual-address read (all devices in programming mode answer with their
+    address), then reads each one's :class:`DeviceOverview` over a point-to-point connection. A
+    device that answers the broadcast but fails the follow-up read is still returned, with its
+    ``error`` set, so the user sees it was present."""
+    from xknx.management.procedures import nm_individual_address_read
+
+    addresses = await nm_individual_address_read(xknx, timeout=timeout)
+    seen: set[str] = set()
+    results: list[ScannedDevice] = []
+    for address in addresses:
+        text = str(address)
+        # A device retransmits its response several times within the timeout window, so the same
+        # address can appear more than once; read each device only once.
+        if text in seen:
+            continue
+        seen.add(text)
+        try:
+            overview = await read_device_overview(xknx, text)
+            results.append(ScannedDevice(text, overview=overview))
+        except Exception as exc:  # bus timeout / device dropped the link mid-read
+            results.append(ScannedDevice(text, error=str(exc)))
+    return results
+
+
 def runtime_managed_addresses(device: Device) -> set[int]:
     """Absolute memory addresses of system parameters the device sets at runtime.
 
@@ -257,6 +301,9 @@ async def download_device(
     for default/merged procedure styles). ``progress`` (optional) is called
     ``progress(done, total)`` after each executed load control. ``security`` (KNX Data
     Secure tool key) secures every management APDU when set; ``None`` programs in the clear.
+
+    A full download commissions a virgin device: if nothing answers at the device's
+    address, the address is first written to the single device in programming mode.
     """
     await download(
         xknx,
@@ -265,6 +312,7 @@ async def download_device(
         master=master,
         image=_image_for(device, group_communication),
         scope=scope,
+        commission=True,
         progress=progress,
         security=security,
     )

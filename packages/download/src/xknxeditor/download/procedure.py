@@ -296,6 +296,7 @@ class LoadProcedureRunner:
         expected_descriptor: int | None = None,
         negotiate_apdu: bool = False,
         apdu_overhead: int = 0,
+        authorize_levels: int = 0,
     ) -> None:
         """Initialize the runner.
 
@@ -336,6 +337,7 @@ class LoadProcedureRunner:
         self._negotiate_apdu = negotiate_apdu
         self._descriptor_checked = False
         self._negotiated_apdu: int | None = None
+        self._authorize_levels = authorize_levels
         self._controls = (
             list(controls)
             if controls is not None
@@ -472,13 +474,15 @@ class LoadProcedureRunner:
         return self._programmer
 
     async def _prepare_device(self, programmer: DeviceProgrammer) -> None:
-        """Guard the device mask and negotiate the APDU length, once per run.
+        """Guard the device mask, negotiate the APDU length, and authorize.
 
         Runs on the first opened connection: reads the device descriptor to
         confirm the mask matches ``expected_descriptor`` (guarding against
         programming the wrong device) and reads the device's maximum APDU length
         to use larger telegrams. The negotiated length is remembered and reapplied
-        after a reconnect, so it is read only once.
+        after a reconnect, so it is read only once. When the mask uses access
+        protection (``authorize_levels`` greater than zero) an A_Authorize
+        handshake runs on every connection, before any write.
         """
         if self._expected_descriptor is not None and not self._descriptor_checked:
             actual = await programmer.read_device_descriptor()
@@ -504,6 +508,20 @@ class LoadProcedureRunner:
                     device_max,
                 )
             programmer.max_apdu_length = self._negotiated_apdu
+        if self._authorize_levels > 0:
+            # Access protection is per connection, so authorize on every open (a
+            # Restart drops the connection and the next control reconnects). No
+            # per-device access key is available here, so free access is used; a
+            # device with no key set grants full access (level 0) for it.
+            level = await programmer.authorize()
+            if level == 0:
+                logger.debug("authorized with free access (level 0)")
+            else:
+                logger.warning(
+                    "device granted only access level %d for the free access key; "
+                    "it may be locked with an access key and refuse writes",
+                    level,
+                )
 
     async def _close(self) -> None:
         """Close the current connection when the runner manages the lifecycle."""

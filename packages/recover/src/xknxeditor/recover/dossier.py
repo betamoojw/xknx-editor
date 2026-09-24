@@ -9,6 +9,7 @@ answers empty, which is reported as ``None`` rather than failing.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -36,11 +37,25 @@ class DeviceDossier:
     hardware_type: str | None = None
 
 
-async def _read(programmer: DeviceProgrammer, property_id: int) -> bytes:
-    try:
-        return await programmer.read_property(0, property_id)
-    except (DownloadError, XKNXException):
-        return b""
+async def _read(
+    programmer: DeviceProgrammer,
+    property_id: int,
+    *,
+    attempts: int = 3,
+    retry_delay: float = 0.1,
+) -> bytes:
+    """Read a Device Object property, tolerating both absent properties and transient misses.
+
+    A property the device does not expose answers with an empty (non-erroring) response, returned
+    as ``b""`` on the first try. A *failed* read (telegram lost on the tunnel, device busy) raises
+    and is retried, so a transient miss does not blank a property the device actually has."""
+    for attempt in range(max(attempts, 1)):
+        try:
+            return await programmer.read_property(0, property_id)
+        except (DownloadError, XKNXException):
+            if attempt + 1 < attempts:
+                await asyncio.sleep(retry_delay)
+    return b""
 
 
 def _ascii(data: bytes) -> str | None:

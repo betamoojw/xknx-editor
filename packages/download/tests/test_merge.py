@@ -5,7 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import cast
 
-from xknxeditor.download.merge import resolve_download_controls
+from xknxeditor.download.merge import (
+    mask_authorize_levels,
+    resolve_download_controls,
+)
 from xknxeditor.namespaces.intermediate.ld_ctrl_connect_t import LdCtrlConnect
 from xknxeditor.namespaces.intermediate.ld_ctrl_merge_t import LdCtrlMerge
 from xknxeditor.namespaces.intermediate.ld_ctrl_restart_t import LdCtrlRestart
@@ -145,3 +148,42 @@ def test_unload_without_master_raises() -> None:
         resolve_download_controls(
             cast("object", application), None, procedure_type=ProcedureType.UNLOAD
         )  # type: ignore[arg-type]
+
+
+def _master_with_features(*features: object) -> MasterData:
+    mask = SimpleNamespace(
+        id=_MASK,
+        hawk_configuration_data=[
+            SimpleNamespace(features=SimpleNamespace(feature=list(features)))
+        ],
+    )
+    return cast(
+        "MasterData",
+        SimpleNamespace(mask_versions=SimpleNamespace(mask_version=[mask])),
+    )
+
+
+def _feature(name: str, value: int) -> object:
+    # The parsed model wraps the name in an enum with a ``value`` attribute; mimic it.
+    return SimpleNamespace(name=SimpleNamespace(value=name), value=value)
+
+
+def test_mask_authorize_levels_returns_feature_value() -> None:
+    master = _master_with_features(
+        _feature("MaxApduLength", 254), _feature("AuthorizeLevels", 4)
+    )
+    assert mask_authorize_levels(master, _MASK) == 4
+
+
+def test_mask_authorize_levels_absent_feature_is_zero() -> None:
+    master = _master_with_features(_feature("MaxApduLength", 254))
+    assert mask_authorize_levels(master, _MASK) == 0
+
+
+def test_mask_authorize_levels_without_master_is_zero() -> None:
+    assert mask_authorize_levels(None, _MASK) == 0
+
+
+def test_mask_authorize_levels_unknown_mask_is_zero() -> None:
+    master = _master_with_features(_feature("AuthorizeLevels", 16))
+    assert mask_authorize_levels(master, "MV-9999") == 0

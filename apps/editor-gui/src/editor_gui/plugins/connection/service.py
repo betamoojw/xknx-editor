@@ -14,7 +14,6 @@ from xknx.management.procedures import (
     dm_restart,
     nm_individual_address_read,
     nm_individual_address_serial_number_write,
-    nm_individual_address_write,
 )
 
 if TYPE_CHECKING:
@@ -204,6 +203,45 @@ class ConnectionService:
             return None
         return self.run_async(nm_individual_address_read(self._xknx, timeout=timeout))
 
+    def scan_programming_mode(self, timeout: float = 3.0) -> Future[Any] | None:
+        """Find devices in programming mode and read each one's dossier off the bus.
+
+        Holds the exclusive bus slot for the whole scan (broadcast + per-device point-to-point
+        reads) and releases it in the done-callback. The result is a list of
+        :class:`~editor_gui.programming.ScannedDevice`; the caller attaches its own callback to
+        consume it."""
+        if self.not_connected("scan_programming_mode"):
+            return None
+        from editor_gui.programming import scan_programming_mode_devices
+
+        if not self.begin_operation("scan_progmode", "broadcast"):
+            self._log.warning("A bus operation is already running")
+            return None
+        self._log.info("Scanning for devices in programming mode")
+        future = self.run_async(
+            scan_programming_mode_devices(self._xknx, timeout=timeout)
+        )
+        if future is not None:
+            future.add_done_callback(self._log_progmode_scan_result)
+        else:
+            self._clear_busy()
+        return future
+
+    def _log_progmode_scan_result(self, future: Future[Any]) -> None:
+        self._clear_busy()
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is not None:
+            self._log.error("Programming-mode scan failed", error=str(exc))
+            return
+        results = future.result()
+        self._log.info(
+            "Devices in programming mode",
+            count=len(results),
+            addresses=[r.address for r in results],
+        )
+
     def assign_individual_address_by_serial(
         self, serial: bytes, address: str
     ) -> Future[Any] | None:
@@ -222,7 +260,14 @@ class ConnectionService:
         if self.not_connected("assign_individual_address"):
             return None
         self._log.debug("Assigning individual address", address=address)
-        return self.run_async(nm_individual_address_write(self._xknx, address))
+        # Match ETS: write the address to the device in programming mode without
+        # restarting it. xknx's nm_individual_address_write restarts the device
+        # here, which leaves it briefly unreachable and races a following
+        # download; program_individual_address writes directly and leaves the
+        # device running (and in programming mode, as ETS does).
+        from xknxeditor.download.commissioning import program_individual_address
+
+        return self.run_async(program_individual_address(self._xknx, address))
 
     def assign_individual_address_for_device(
         self, device: Device
@@ -404,6 +449,15 @@ class ConnectionService:
         exc = future.exception()
         if exc is not None:
             self._log.error("Programming failed", error=str(exc))
+            if isinstance(exc, ManagementConnectionError):
+                # A full download of a virgin device first writes its address to the single
+                # device in programming mode; nothing answering here usually means the device
+                # is not in (or more than one device is in) programming mode.
+                self._log.error(
+                    "No device responded at the address — for a new device put exactly "
+                    "one device into programming mode; otherwise check it is powered and "
+                    "reachable from this interface (line/coupler)"
+                )
             self._set_program_notice(False)
         else:
             self._log.info("Programming complete")

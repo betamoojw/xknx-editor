@@ -1758,6 +1758,7 @@ class KnxGuiApp:
         self._render_knxprod_result_modal()
         self._keyring_plugin.render_window()
         self._signing_plugin.render_window()
+        self._connection_plugin.render_window()
         self._render_welcome()
         # Programming queue: advance it every frame (robust wakeup even if the bus was freed by a
         # non-queue op), and while devices wait behind the running one show the queue window instead

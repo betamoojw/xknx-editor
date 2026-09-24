@@ -949,6 +949,10 @@ class ProjectStrings:
         return _("Unload")
 
     @property
+    def SCOPE_UNLOAD_ALL(self) -> str:
+        return _("Unload application and address")
+
+    @property
     def SCOPE_PARAMETERS(self) -> str:
         return _("Partial: Parameters")
 

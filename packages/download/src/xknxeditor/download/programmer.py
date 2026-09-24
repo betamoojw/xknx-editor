@@ -20,6 +20,8 @@ import logging
 from typing import TYPE_CHECKING, Protocol
 
 from xknx.telegram.apci import (
+    AuthorizeRequest,
+    AuthorizeResponse,
     DeviceDescriptorRead,
     DeviceDescriptorResponse,
     FunctionPropertyCommand,
@@ -58,6 +60,9 @@ _PROPERTY_OVERHEAD = 5
 _MAX_PROPERTY_ELEMENTS = 0xF
 # Default APDU length every KNX device has to support.
 DEFAULT_MAX_APDU_LENGTH = 15
+# Key that requests free access; a device with no access key set grants its
+# highest level (0) for it. Used when no per-device access key is available.
+FREE_ACCESS_KEY = 0xFFFFFFFF
 # Upper bound used when negotiating the APDU length up from the default.
 MAX_NEGOTIATED_APDU_LENGTH = 254
 # Device Object property carrying the device's maximum APDU length (2 octets).
@@ -165,12 +170,28 @@ class DeviceProgrammer:
             return DEFAULT_MAX_APDU_LENGTH
         return int.from_bytes(data, "big")
 
+    async def authorize(self, key: int = FREE_ACCESS_KEY) -> int:
+        """Authorize on the connection and return the granted access level.
+
+        A_Authorize_Request presents a 4 octet key; the device answers with the
+        access level it grants (0 = full access, 15 = none). Sent once per
+        connection before writing, for masks that use access protection
+        (KNX Standard v3.0.0, 3/3/7 A_Authorize; 3/5/2 DM_Authorize).
+        """
+        telegram = await self.connection.request(
+            AuthorizeRequest(key=key), AuthorizeResponse
+        )
+        payload = telegram.payload
+        if not isinstance(payload, AuthorizeResponse):
+            raise VerificationError("no authorize response received")
+        return payload.level
+
     def _block_count(self, address: int, remaining: int) -> int:
         """Octets to transfer next: the APDU chunk, clamped to the 64 KiB boundary.
 
         A single A_Memory_/A_UserMemory_ transfer must not straddle the 64 KiB
         boundary (the address space and APCI change there), so a block that would
-        cross it is cut at the boundary (Hawk eo.cs splits the same way).
+        cross it is cut at the boundary.
         """
         count = min(self.memory_chunk_size, remaining)
         if address < _USER_MEMORY_BOUNDARY < address + count:

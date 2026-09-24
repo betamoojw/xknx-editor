@@ -5,6 +5,8 @@ from __future__ import annotations
 from xknx.telegram import IndividualAddress, Telegram
 from xknx.telegram.apci import (
     APCI,
+    AuthorizeRequest,
+    AuthorizeResponse,
     DeviceDescriptorRead,
     DeviceDescriptorResponse,
     FunctionPropertyCommand,
@@ -61,6 +63,9 @@ class FakeDevice:
         # Function property command/read state, keyed by (object, property).
         self.function_properties: dict[tuple[int, int], bytes] = {}
         self.function_property_return_code = 0
+        # Access level the device grants for an A_Authorize, and the keys it saw.
+        self.authorize_level = 0
+        self.authorize_keys: list[int] = []
         # Quirk emulation: when set, an A_Memory_Read requesting more than this many octets answers
         # with a ZERO-length MemoryResponse (as observed on BIM M112 / mask 0701), forcing the
         # reader to back the block size off. None = always serve the full requested count.
@@ -118,6 +123,9 @@ class FakeDevice:
             return self._telegram(
                 DeviceDescriptorResponse(descriptor=0, value=self.descriptor)
             )
+        if isinstance(payload, AuthorizeRequest):
+            self.authorize_keys.append(payload.key)
+            return self._telegram(AuthorizeResponse(level=self.authorize_level))
         if isinstance(payload, FunctionPropertyCommand):
             self.function_properties[(payload.object_index, payload.property_id)] = (
                 payload.data

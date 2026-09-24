@@ -212,3 +212,20 @@ async def test_restart() -> None:
     device = FakeDevice()
     await DeviceProgrammer(device).restart()
     assert device.restarted
+
+
+async def test_authorize_returns_granted_level() -> None:
+    device = FakeDevice()
+    device.authorize_level = 0
+    level = await DeviceProgrammer(device).authorize()
+    assert level == 0
+    # Free access key is presented when no per-device key is available.
+    assert device.authorize_keys == [0xFFFFFFFF]
+
+
+async def test_authorize_reports_locked_level() -> None:
+    device = FakeDevice()
+    device.authorize_level = 15  # device locked with an access key
+    level = await DeviceProgrammer(device).authorize(key=0x11223344)
+    assert level == 15
+    assert device.authorize_keys == [0x11223344]

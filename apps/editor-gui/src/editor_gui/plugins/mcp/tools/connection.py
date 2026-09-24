@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from editor_gui.device import Device
 
 # Download scopes (schema enum); maps to xknxeditor.download.scope.DownloadScope in _resolve_scope.
-Scope = Literal["FULL", "PARAMETERS", "GROUP_COMMUNICATION", "APPLICATION", "UNLOAD"]
+Scope = Literal[
+    "FULL", "PARAMETERS", "GROUP_COMMUNICATION", "APPLICATION", "UNLOAD", "UNLOAD_ALL"
+]
 
 
 def _resolve_scope(scope: str | None) -> Any:

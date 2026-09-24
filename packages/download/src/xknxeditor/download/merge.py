@@ -136,3 +136,32 @@ def _default_procedure(
                 if procedure.procedure_type == procedure_type:
                     return procedure
     return None
+
+
+# Feature name (in a mask version's configuration data) carrying the number of
+# access-protection levels; greater than zero means an A_Authorize handshake is
+# expected before writing.
+_AUTHORIZE_LEVELS_FEATURE = "AuthorizeLevels"
+
+
+def mask_authorize_levels(master_data: MasterData | None, mask_version_id: str) -> int:
+    """Return the mask version's AuthorizeLevels, or 0 when unknown or absent.
+
+    A value greater than zero means the device uses access protection, so an
+    A_Authorize handshake is performed before writing. Without master data the
+    value is unknown and 0 is returned (no authorize attempted).
+    """
+    if master_data is None or master_data.mask_versions is None:
+        return 0
+    for mask_version in master_data.mask_versions.mask_version:
+        if mask_version.id != mask_version_id:
+            continue
+        for configuration in mask_version.hawk_configuration_data:
+            features = configuration.features
+            if features is None:
+                continue
+            for feature in features.feature:
+                name = getattr(feature.name, "value", feature.name)
+                if name == _AUTHORIZE_LEVELS_FEATURE:
+                    return feature.value or 0
+    return 0

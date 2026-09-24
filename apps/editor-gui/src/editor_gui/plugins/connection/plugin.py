@@ -5,10 +5,11 @@ import threading
 from collections.abc import Coroutine
 from concurrent.futures import Future
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from imgui_bundle import imgui, imspinner
+from imgui_bundle import hello_imgui, imgui, imspinner
 from xknx import XKNX
+from xknx.exceptions import ConfirmationError
 from xknx.io.connection import ConnectionConfig, ConnectionType
 from xknx.io.const import DEFAULT_MCAST_GRP
 from xknx.io.gateway_scanner import GatewayDescriptor, GatewayScanner
@@ -18,7 +19,16 @@ from editor_gui.color import color_u32
 from editor_gui.plugins.base import Logger, PanelDefinition, PluginAPI
 from editor_gui.plugins.connection.interface import ObservableKNXIPInterfaceThreaded
 from editor_gui.plugins.connection.strings import S
+from editor_gui.programming import (
+    DEFAULT_INDIVIDUAL_ADDRESS,
+    DeviceOverview,
+    ScannedDevice,
+)
 from editor_gui.settings import load_settings, save_settings
+from xknxeditor.prod.app_id import parse_app_id
+
+if TYPE_CHECKING:
+    from xknxeditor.catalog import ProductSummary
 
 _SETTINGS = "connection"
 
@@ -64,6 +74,17 @@ class ConnectionPlugin:
         # "Local Network" permission prompt and returns no gateways; a delayed retry picks them up
         # once the user has allowed it. Guarded so it fires at most once per autostart.
         self._autostart_retry_done = False
+
+        # "Devices in programming mode" window state (opened from the Diagnostics menu).
+        self._progmode_open = False
+        self._progmode_scanning = False
+        self._progmode_scanned = (
+            False  # a scan has completed at least once (empty vs. not-yet-run)
+        )
+        self._progmode_results: list[ScannedDevice] = []
+        self._progmode_error: str | None = (
+            None  # last scan's failure, shown in the window
+        )
 
     @property
     def state(self) -> ConnectionState:
@@ -427,25 +448,214 @@ class ConnectionPlugin:
             imgui.same_line()
             imgui.text_disabled(S.STATUS_DISCONNECTED)
 
-    def _read_programming_mode_devices(self) -> None:
-        """Diagnostics: read the individual addresses of devices currently in programming mode."""
-        future = self._api.connection.read_programming_mode_devices()
-        if future is None:
+    def _open_progmode_window(self) -> None:
+        """Open the 'Devices in programming mode' window and kick off a first scan."""
+        self._progmode_open = True
+        self._scan_progmode()
+
+    def _scan_progmode(self) -> None:
+        """Broadcast for devices in programming mode and read each one's dossier. Results and the
+        scanning flag are updated from the async done-callback and read by ``render_window`` each
+        frame (the same direct cross-thread assignment the gateway scan uses)."""
+        if self._progmode_scanning:
             return
+        future = self._api.connection.scan_programming_mode()
+        if future is None:
+            return  # not connected / bus busy — the service already logged why
+        self._progmode_scanning = True
+        self._progmode_error = None
 
         def _done(f: "Future[Any]") -> None:
+            self._progmode_scanning = False
+            self._progmode_scanned = True
             try:
-                addresses = f.result()
-            except Exception as e:  # bus timeout / not connected / xknx error
-                self._log.error("programming-mode read failed", error=str(e))
-                return
-            self._log.info(
-                "devices in programming mode",
-                count=len(addresses),
-                addresses=[str(a) for a in addresses],
-            )
+                self._progmode_results = f.result()
+            except ConfirmationError as e:  # interface did not ack the broadcast
+                self._log.error("programming-mode scan failed", error=str(e))
+                self._progmode_results = []
+                self._progmode_error = S.PROGMODE_NO_CONFIRM
+            except (
+                Exception
+            ) as e:  # bus timeout / xknx error (also logged by the service)
+                self._log.error("programming-mode scan failed", error=str(e))
+                self._progmode_results = []
+                self._progmode_error = S.PROGMODE_SCAN_FAILED.format(error=str(e))
 
         future.add_done_callback(_done)
+
+    def render_window(self) -> None:
+        """The 'Devices in programming mode' window; called from the overlay pass."""
+        if not self._progmode_open:
+            return
+        imgui.set_next_window_size(
+            hello_imgui.em_to_vec2(30.0, 24.0), imgui.Cond_.first_use_ever
+        )
+        expanded, open_state = imgui.begin(
+            f"{S.PROGMODE_TITLE}###progmode_window", True
+        )
+        self._progmode_open = bool(open_state)
+        if expanded:
+            self._render_progmode_contents()
+        imgui.end()
+
+    def _render_progmode_contents(self) -> None:
+        imgui.begin_disabled(self._progmode_scanning)
+        if imgui.button(S.PROGMODE_RESCAN):
+            self._scan_progmode()
+        imgui.end_disabled()
+        if self._progmode_scanning:
+            imgui.same_line()
+            imspinner.spinner_ang(
+                "##progmode-spinner",
+                7,
+                2,
+                color=imgui.ImColor(
+                    imgui.get_style_color_vec4(imgui.Col_.tab_selected)
+                ),
+            )
+            imgui.same_line()
+            imgui.text_disabled(S.PROGMODE_SEARCHING)
+        imgui.push_text_wrap_pos(0.0)
+        imgui.text_disabled(S.PROGMODE_HINT)
+        imgui.pop_text_wrap_pos()
+        imgui.separator()
+
+        if not self._progmode_results:
+            if self._progmode_error is not None:
+                imgui.push_text_wrap_pos(0.0)
+                imgui.text_colored(
+                    imgui.ImVec4(0.95, 0.55, 0.35, 1.0), self._progmode_error
+                )
+                imgui.pop_text_wrap_pos()
+            elif self._progmode_scanned and not self._progmode_scanning:
+                imgui.text_disabled(S.PROGMODE_NONE)
+            return
+        imgui.text_disabled(S.PROGMODE_COUNT.format(count=len(self._progmode_results)))
+        imgui.spacing()
+        for index, found in enumerate(self._progmode_results):
+            self._render_progmode_device(index, found)
+
+    def _render_progmode_device(self, index: int, found: ScannedDevice) -> None:
+        # A factory-fresh device that was never programmed answers with the default address; it is
+        # not a project device, so it gets its own label rather than a "not in this project" note.
+        unprogrammed = found.address == DEFAULT_INDIVIDUAL_ADDRESS
+        device = (
+            None
+            if unprogrammed
+            else self._api.project.find_device_by_address(found.address)
+        )
+        header = found.address
+        if device is not None:
+            header = f"{found.address}  —  {device.name}"
+        imgui.set_next_item_open(True, imgui.Cond_.first_use_ever)
+        if not imgui.collapsing_header(f"{header}###progmode_{index}"):
+            return
+        imgui.indent()
+        if unprogrammed:
+            imgui.text_colored(
+                imgui.ImVec4(0.95, 0.75, 0.35, 1.0), S.PROGMODE_UNPROGRAMMED
+            )
+        elif device is not None:
+            imgui.text_disabled(S.PROGMODE_IN_PROJECT.format(name=device.name))
+            imgui.same_line()
+            if imgui.small_button(f"{S.PROGMODE_SELECT}##progmode_sel_{index}"):
+                self._api.project.selected_device = device
+                self._api.project.focus_editor()
+        else:
+            imgui.text_disabled(S.PROGMODE_NOT_IN_PROJECT)
+
+        overview = found.overview
+        if overview is None:
+            imgui.push_text_wrap_pos(0.0)
+            imgui.text_colored(
+                imgui.ImVec4(0.95, 0.55, 0.35, 1.0),
+                S.PROGMODE_READ_FAILED.format(error=found.error or ""),
+            )
+            imgui.pop_text_wrap_pos()
+            imgui.unindent()
+            return
+
+        self._render_progmode_status(overview)
+        mask = (
+            f"{overview.mask_version:#06x}" if overview.mask_version is not None else ""
+        )
+        app_v = (
+            f"V{overview.application_version}" if overview.application_version else ""
+        )
+        app_no = (
+            f"{overview.application_number:#06x}"
+            if overview.application_number is not None
+            else ""
+        )
+        product = self._catalog_product(overview)
+        rows: list[tuple[str, str]] = [
+            (S.PROGMODE_MANUFACTURER, self._manufacturer_label(overview.manufacturer)),
+        ]
+        if product is not None:
+            rows.append((S.PROGMODE_PRODUCT, self._product_label(product)))
+        rows += [
+            (S.PROGMODE_APPLICATION, app_no),
+            (S.PROGMODE_APP_VERSION, app_v),
+            (S.PROGMODE_MASK, mask),
+            (S.PROGMODE_SERIAL, overview.serial_number or ""),
+            (S.PROGMODE_ORDER, overview.order_info or ""),
+            (S.PROGMODE_HARDWARE, overview.hardware_type or ""),
+        ]
+        for label, value in rows:
+            imgui.text_disabled(label)
+            imgui.same_line(160.0)
+            imgui.text(value or "-")
+        imgui.unindent()
+
+    def _manufacturer_label(self, manufacturer_id: str | None) -> str:
+        """Resolve the raw ``M-xxxx`` manufacturer id to its name (from the global master data) if
+        available, e.g. ``Robert Bosch (M-0002)``; fall back to the bare id."""
+        if not manufacturer_id:
+            return ""
+        master = self._api.connection.master
+        name = master.manufacturers.get(manufacturer_id) if master is not None else None
+        return f"{name} ({manufacturer_id})" if name else manufacturer_id
+
+    def _catalog_product(self, overview: DeviceOverview) -> "ProductSummary | None":
+        """Match the device read off the bus to a product in the local catalog by manufacturer +
+        application number (the parts of the application-program id that identify the product's
+        application, independent of the concrete version). ``None`` if the catalog has no match."""
+        manufacturer = overview.manufacturer
+        app_number = overview.application_number
+        if not manufacturer or app_number is None:
+            return None
+        manufacturer = manufacturer.upper()
+        for product in self._api.catalog.get_products():
+            if not product.application_id:
+                continue
+            parsed = parse_app_id(product.application_id)
+            if (
+                parsed is not None
+                and parsed.manufacturer_id == manufacturer
+                and parsed.application_number == app_number
+            ):
+                return product
+        return None
+
+    def _product_label(self, product: "ProductSummary") -> str:
+        name = product.name or product.product_ref_id
+        if product.order_number:
+            return f"{name}  ({product.order_number})"
+        return name
+
+    def _render_progmode_status(self, overview: DeviceOverview) -> None:
+        """Programming-mode flag + device error class, coloured like the editor's diagnosis."""
+        imgui.text_disabled(S.PROGMODE_STATUS)
+        imgui.same_line(160.0)
+        if overview.error_code is None or overview.error_code == 0:
+            imgui.text_colored(imgui.ImVec4(0.45, 0.8, 0.45, 1.0), S.PROGMODE_STATUS_OK)
+        else:
+            imgui.text_colored(
+                imgui.ImVec4(0.95, 0.55, 0.35, 1.0), overview.error_text or ""
+            )
+        if overview.programming_mode:
+            imgui.same_line()
+            imgui.text_colored(imgui.ImVec4(0.95, 0.75, 0.35, 1.0), S.PROGMODE_FLAG_ON)
 
     def render_menu(self) -> None:
         if imgui.begin_menu(S.MENU_CONNECTION):
@@ -460,7 +670,7 @@ class ConnectionPlugin:
                             f"  KNX Address: {self._gateway_info.individual_address}"
                         )
                     imgui.text(f"  Core Version: {self._gateway_info.core_version}")
-                    services = []
+                    services: list[str] = []
                     if self._gateway_info.supports_tunnelling:
                         services.append("Tunneling")
                     if self._gateway_info.supports_tunnelling_tcp:
@@ -473,8 +683,8 @@ class ConnectionPlugin:
                         imgui.text(f"  Services: {', '.join(services)}")
                 imgui.separator()
                 imgui.text_disabled(S.SECTION_DIAGNOSTICS)
-                if imgui.menu_item(S.MENU_READ_PROGMODE, "", False)[0]:
-                    self._read_programming_mode_devices()
+                if imgui.menu_item(S.MENU_READ_PROGMODE, "", self._progmode_open)[0]:
+                    self._open_progmode_window()
                 imgui.separator()
                 if imgui.menu_item(S.MENU_DISCONNECT, "", False)[0]:
                     self.disconnect()

@@ -32,6 +32,107 @@ class ConnectionStrings:
         return _("Check for devices in programming mode")
 
     @property
+    def PROGMODE_TITLE(self) -> str:
+        return _("Devices in programming mode")
+
+    @property
+    def PROGMODE_RESCAN(self) -> str:
+        return _("Rescan")
+
+    @property
+    def PROGMODE_SEARCHING(self) -> str:
+        return _("Searching the bus…")
+
+    @property
+    def PROGMODE_HINT(self) -> str:
+        return _(
+            "Press the programming button on a device to put it into programming mode, then rescan."
+        )
+
+    @property
+    def PROGMODE_NONE(self) -> str:
+        return _("No device is in programming mode.")
+
+    @property
+    def PROGMODE_SCAN_FAILED(self) -> str:
+        return _("The scan could not be completed: {error}")
+
+    @property
+    def PROGMODE_NO_CONFIRM(self) -> str:
+        return _(
+            "The interface did not confirm the scan request (bus busy or interface "
+            "overloaded). Please try again."
+        )
+
+    @property
+    def PROGMODE_COUNT(self) -> str:
+        return _("{count} device(s) in programming mode")
+
+    @property
+    def PROGMODE_READ_FAILED(self) -> str:
+        return _("Answered the scan, but reading its details failed: {error}")
+
+    @property
+    def PROGMODE_IN_PROJECT(self) -> str:
+        return _("In this project: {name}")
+
+    @property
+    def PROGMODE_NOT_IN_PROJECT(self) -> str:
+        return _("Not in this project")
+
+    @property
+    def PROGMODE_UNPROGRAMMED(self) -> str:
+        return _("Unprogrammed device (factory default address 15.15.255)")
+
+    @property
+    def PROGMODE_SELECT(self) -> str:
+        return _("Select in project")
+
+    @property
+    def PROGMODE_MANUFACTURER(self) -> str:
+        return _("Manufacturer")
+
+    @property
+    def PROGMODE_PRODUCT(self) -> str:
+        return _("Product (catalog)")
+
+    @property
+    def PROGMODE_APPLICATION(self) -> str:
+        return _("Application")
+
+    @property
+    def PROGMODE_APP_VERSION(self) -> str:
+        return _("Application version")
+
+    @property
+    def PROGMODE_MASK(self) -> str:
+        return _("Mask version")
+
+    @property
+    def PROGMODE_SERIAL(self) -> str:
+        return _("Serial number")
+
+    @property
+    def PROGMODE_ORDER(self) -> str:
+        return _("Order number")
+
+    @property
+    def PROGMODE_HARDWARE(self) -> str:
+        return _("Hardware type")
+
+    @property
+    def PROGMODE_STATUS(self) -> str:
+        return _("Status")
+
+    @property
+    def PROGMODE_STATUS_OK(self) -> str:
+        return _("No fault")
+
+    @property
+    def PROGMODE_FLAG_ON(self) -> str:
+        return _("Programming mode active")
+
+    @property
     def NO_GATEWAYS_FOUND(self) -> str:
         return _("No gateways found")
 

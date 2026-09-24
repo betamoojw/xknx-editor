@@ -481,11 +481,11 @@ def _localname(tag: str) -> str:
 def _encode_binary_name(name: str) -> str:
     """Encode a BinaryData ``Name`` into the id/filename form used in the archive.
 
-    ``BinaryData@Id`` is ``{DeviceInstanceId}_{encoded Name}`` and stores the payload in
-    ``BinaryData/{Id}.dat``. A
-    letter/digit is kept verbatim, anything else is escaped as ``.`` + two uppercase hex digits per
-    UTF-8 byte — so ``DaliGC16-Backup-Store`` -> ``DaliGC16.2DBackup.2DStore`` (``-`` is 0x2D) and a
-    non-ASCII char emits one ``.XX`` per UTF-8 byte.
+    ``BinaryData@Id`` is ``{DeviceInstanceId}_{encoded Name}`` and the payload is stored in
+    ``BinaryData/{Id}.dat``. A letter/digit is kept verbatim; anything else is escaped as ``.``
+    plus two uppercase hex digits per UTF-8 byte, so ``DaliGC16-Backup-Store`` becomes
+    ``DaliGC16.2DBackup.2DStore`` (``-`` is 0x2D) and a non-ASCII char emits one ``.XX`` per UTF-8
+    byte.
     """
     out: list[str] = []
     for char in name:
